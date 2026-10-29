@@ -1,5 +1,6 @@
 """Independent terminal-native Git workspace: async jobs, views and labelled forms."""
 import queue
+import re
 import threading
 from typing import Any
 from git_workspace import Repository
@@ -8,6 +9,57 @@ from git_workspace import Repository
 def visible(text):
     """Keep filenames and subprocess output from injecting terminal controls."""
     return ''.join(c if c == '\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in str(text))
+
+
+def diff_rows(patch, width, wrap, styles):
+    """Render unified patches without altering the underlying operation output."""
+    base, muted, text, accent, _ = styles
+    added, removed = '\033[38;5;114m', '\033[38;5;203m'
+    lines = patch.splitlines()
+    if not any(line.startswith('diff --git ') for line in lines):
+        return [row for line in lines for row in wrap(base + text + visible(line), width)]
+    records = []
+    old = new = None
+    additions = deletions = files = 0
+    for line in lines:
+        if line.startswith('diff --git '):
+            files += 1
+            old = new = None
+            records.extend([('', muted, '', ''), ('File: ' + line[11:], accent, '', '')])
+        elif line.startswith('@@ '):
+            match = re.match(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)', line)
+            if match:
+                old, new = int(match[1]), int(match[2])
+                records.append((f'Lines {old} -> {new}' + match[3], accent, '', ''))
+            else:
+                old = new = None
+                records.append((line, muted, '', ''))
+        elif old is not None and line.startswith(('+', '-', ' ')):
+            marker, content = line[0], line[1:]
+            before, after = str(old) if marker != '+' else '', str(new) if marker != '-' else ''
+            records.append((marker + ' ' + content, added if marker == '+' else removed if marker == '-' else text,
+                            before, after))
+            old += marker != '+'
+            new += marker != '-'
+            additions += marker == '+'
+            deletions += marker == '-'
+        else:
+            records.append((line, muted, '', ''))
+    digits = max(3, max((len(number) for _, _, before, after in records for number in (before, after)), default=0))
+    gutter_width = 2 * digits + 3
+    show_gutter = width >= gutter_width + 12
+    result = []
+    for line in (f'{files} file(s) | +{additions} added | -{deletions} removed',
+                 'Old / New lines | + added | - removed', ''):
+        result.extend(wrap(base + accent + line, width))
+    for content, color, before, after in records:
+        numbered = bool(before or after)
+        prefix = f'{before:>{digits}} {after:>{digits}} | ' if numbered and show_gutter else ''
+        chunks = wrap(base + color + visible(content).expandtabs(4), max(1, width - len(prefix)))
+        for index, chunk in enumerate(chunks):
+            gutter = prefix if index == 0 else ' ' * len(prefix)
+            result.append(base + muted + gutter + color + chunk)
+    return result
 
 
 class GitPanel:
@@ -45,6 +97,7 @@ class GitPanel:
         self.thread = None
         self.zones: list[tuple[int, int, int, str, Any]] = []
         self.output_rows = 0
+        self.output_is_diff = False
         if auto_refresh:
             self.start('refresh')
 
@@ -126,6 +179,7 @@ class GitPanel:
             if not self.state and error:
                 self.output += '\n\nClose this panel and /cd to a folder in a Git repository.'
             self.message = ('Failed · ' if error else 'Finished · ') + action
+            self.output_is_diff = not error and action in ('diff', 'compare', 'stash_diff')
             if error:
                 self.message += ' · inspect output; interactive credentials/signing: use /run git …'
             updated = True
@@ -257,14 +311,15 @@ class GitPanel:
                                       'p':'pull', 'P':'push', 'y':'sync', 'b':'create', 't':'stash', 'g':'pr', 'e':'explain'}[value])
         return None
 
-    def draw(self, cols, rows, wrap, styles):
+    def draw(self, cols, rows, wrap, styles, top=0):
+        rows = max(0, rows - top)
         base, muted, text, accent, selected = styles
         self.zones = []
         output = [base + '\033[H\033[2J']
 
         def put(row, col, value, width, style=muted):
             if 1 <= row <= rows and 1 <= col <= cols and width > 0:
-                output.append(f'\033[{row};{col}H' + wrap(base + style + visible(value), min(width, cols-col+1))[0])
+                output.append(f'\033[{row + top};{col}H' + wrap(base + style + visible(value), min(width, cols-col+1))[0])
 
         heading, title = self.heading()
         put(1, 1, heading, cols, text)
@@ -308,13 +363,16 @@ class GitPanel:
         output_height = max(0, rows-out_row-2)
         # Wrap before scrolling so very long lines remain accessible.
         physical = []
-        for line in self.output.splitlines():
-            physical.extend(wrap(text + visible(line), max(1,cols-out_col+1)))
+        if self.output_is_diff:
+            physical = diff_rows(self.output, max(1,cols-out_col+1), wrap, styles)
+        else:
+            for line in self.output.splitlines():
+                physical.extend(wrap(text + visible(line), max(1,cols-out_col+1)))
         self.output_rows = len(physical)
         self.offset = min(self.offset,max(0,len(physical)-output_height))
         for n,line in enumerate(physical[self.offset:self.offset+output_height]):
             if out_row+n < rows-2:
-                output.append(f'\033[{out_row+n};{out_col}H'+base+line)
+                output.append(f'\033[{out_row+n+top};{out_col}H'+base+line)
         hint = self.hints.get(self.actions()[self.action_index][1], '') if self.focus == 'actions' else ''
         put(rows-2,1,self.message,cols,accent)
         put(rows-1,1,hint or '1–4 views · Tab focus · arrows select · Enter inspect/action · wheel scroll output',cols)
@@ -323,7 +381,7 @@ class GitPanel:
             form = self.form
             first = max(4, rows-len(form['fields'])-5)
             for row in range(first, rows+1):
-                output.append(f'\033[{row};1H'+base+' '*cols)
+                output.append(f'\033[{row+top};1H'+base+' '*cols)
             put(first,1,form['summary'],cols,text)
             for n,(name,value) in enumerate(form['fields']):
                 put(first+n+1,1,('› ' if n == form['index'] else '  ')+name+': '+value,cols,selected if n == form['index'] else text)
@@ -331,5 +389,7 @@ class GitPanel:
             put(row,1,'[Apply]',7,accent)
             self.zones = [(row,1,7,'submit',None)]
             put(rows,1,'Enter applies · Tab next field · Esc cancels',cols)
+        self.zones = [(row + top, left, right, action, argument)
+                      for row, left, right, action, argument in self.zones]
         output.append('\033[?25l')
         return ''.join(output)

@@ -35,6 +35,7 @@ from git_panel import GitPanel
 from network_panel import NetworkPanel
 from response_rendering import render_markdown
 from file_preview import render_file_preview
+import investigation
 
 MODEL_NAME = "linux-cmds-7b"
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -243,14 +244,14 @@ class BookmarkStore:
         self._save([item for item in self.items if item['id'] != bookmark_id])
 
     def save_session(self, session):
-        history = [{key: turn[key] for key in ('prompt', 'response', 'cmd', 'kind', 'pending', 'error', 'execution_output', 'cwd', 'interactive', 'exit_code', 'log_path', 'duration', 'handoff', 'local', 'doc_references', 'inspector_context')
+        history = [{key: turn[key] for key in ('prompt', 'response', 'cmd', 'kind', 'pending', 'error', 'execution_output', 'cwd', 'interactive', 'exit_code', 'log_path', 'duration', 'handoff', 'local', 'doc_references', 'inspector_context', 'investigation_id', 'investigation_check', 'investigation_context', 'investigation_summary')
                     if key in turn} for turn in session.history]
         first_question = next((turn['prompt'] for turn in history if turn.get('kind') != 'command' and not turn.get('local')), '')
         saved = dict(id=session.session_id, prompt=first_question or 'New conversation',
                      response=history[0]['response'] if history else '', cmd=history[0].get('cmd') if history else None,
                       created_at=session.created_at, history=history, paths=list(session.paths), cwd=session.cwd,
                        browse_directory=session.browse_directory, name=session.name, pins=session.pins,
-                       topic_start=session.topic_start)
+                        topic_start=session.topic_start, investigation=session.investigation)
         items = [saved if item['id'] == session.session_id else item for item in self.items]
         if not any(item['id'] == session.session_id for item in self.items):
             items.append(saved)
@@ -275,6 +276,7 @@ class Conversation:
         self.name = ''
         self.pins = []
         self.topic_start = 0
+        self.investigation = None
         self.browse_directory: str | None = None
         self.changed = lambda: None
 
@@ -282,7 +284,8 @@ class Conversation:
         inspector = inspector_snapshot(self)
         self.history.append(dict(prompt=prompt, response='', cmd=None, pending=True,
                                  execution_output=None, token=uuid4().hex, error=False,
-                                 inspector_context=inspector))
+                                 inspector_context=inspector,
+                                 investigation_context=investigation.snapshot(self.investigation, self.history)))
         self.changed()
         self._start_next()
 
@@ -290,6 +293,11 @@ class Conversation:
         self.inspector_token = None
         self.history.append(dict(prompt=command, response='', cmd=None, pending=True,
                                  token=uuid4().hex, error=False, kind='command', handoff=interactive))
+        if self.investigation and not interactive:
+            for check in self.investigation['checks']:
+                if command == investigation.command(self.investigation, check):
+                    self.history[-1].update(investigation_id=self.investigation['id'], investigation_check=check)
+                    break
         self.changed()
         self._start_next()
 
@@ -362,6 +370,7 @@ class Conversation:
         self.active = None
         self.topic_start = 0
         self.inspector_token = None
+        self.investigation = None
 
     def resume(self, history):
         """Restore completed turns; never rerun interrupted shell commands."""
@@ -406,6 +415,7 @@ COMMANDS = [('/new', 'Start a new conversation'),
             ('/cfg-model', 'Edit Modelfile and build: /cfg-model <name>'),
             ('/exit', 'Exit the app (alias)')]
 COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>'),
+             ('/investigate', 'Guided TCP diagnosis: host:port | next | conclude | off'),
              ('/inspect', 'Show active inspector context; /inspect off detaches it'),
              ('/git', 'Open Git workspace for the current folder: /git [status]'),
              ('/network', 'Discover SMB/NFS/SFTP servers, mount and browse: /network [URL]'),
@@ -648,6 +658,7 @@ def make_session(saved=None):
         directory = saved.get('browse_directory')
         session.browse_directory = directory if isinstance(directory, str) else None
         session.resume(saved['history'])
+        session.investigation = investigation.restore(saved.get('investigation'))
         boundary = saved.get('topic_start', 0)
         session.topic_start = min(len(session.history), max(0, boundary)) if isinstance(boundary, int) else 0
         session.messages.clear()
@@ -957,9 +968,11 @@ def draw_model_picker(cols, rows):
     assert model_picker is not None
     click_zones.clear()
     sys.stdout.write(BASE_STYLE + '\033[H\033[2J')
+    draw_pry_header(cols)
+    rows = max(0, rows - 1)
     def put(row, text, color=GREY):
         if 1 <= row <= rows:
-            sys.stdout.write(f'\033[{row};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
+            sys.stdout.write(f'\033[{row+1};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
     put(1, 'Ollama models — select a chat model', ORANGE)
     put(2, f'Current: {MODEL_NAME}')
     height = max(0, rows - 5)
@@ -970,13 +983,13 @@ def draw_model_picker(cols, rows):
         index = model_picker['top'] + offset
         put(offset + 3, f'{">" if index == model_picker["index"] else " "} {name}' + ('  (current)' if name == MODEL_NAME else ''),
             SELECTED_STYLE if index == model_picker['index'] else ORANGE)
-        click_zones[(offset + 3, 1, cols)] = ('picker_model', index)
+        click_zones[(offset + 4, 1, cols)] = ('picker_model', index)
     put(rows - 2, model_picker['message'])
     put(rows - 1, BUTTON_STYLE + ' Refresh (r) ' + BASE_STYLE)
     put(rows, BUTTON_STYLE + ' Close (Esc) ' + BASE_STYLE + '  Up/Down: move | Enter/click: select')
     if rows >= 5:
-        click_zones[(rows - 1, 1, min(cols, len(' Refresh (r) ')))] = ('picker_refresh', 0)
-        click_zones[(rows, 1, min(cols, len(' Close (Esc) ')))] = ('picker_close', 0)
+        click_zones[(rows, 1, min(cols, len(' Refresh (r) ')))] = ('picker_refresh', 0)
+        click_zones[(rows + 1, 1, min(cols, len(' Close (Esc) ')))] = ('picker_close', 0)
     sys.stdout.flush()
 
 
@@ -1027,7 +1040,9 @@ def handle_submission(text):
     if verb in {entry[0] for entry in COMMANDS[11:]}:
         try:
             assert conversation is not None
-            if verb == '/network':
+            if verb == '/investigate':
+                investigate_command(argument)
+            elif verb == '/network':
                 git_panel = NetworkPanel(conversation.cwd, argument)
             elif verb == '/git':
                 if argument not in ('', 'status', 'cmd'):
@@ -1052,6 +1067,7 @@ def handle_submission(text):
                 conversation.paths.clear()
                 conversation.context_notice = ''
                 conversation.inspector_token = None
+                conversation.investigation = None
                 autosave(conversation)
                 status_message = 'Fresh topic started. Transcript and pins retained; file context cleared.'
                 if argument:
@@ -1484,6 +1500,44 @@ def add_local_result(session, prompt, response, pending=False):
     session.changed()
 
 
+def investigate_command(argument):
+    global current_input_buffer, input_cursor, status_message
+    session = conversation
+    if session.active or any(turn.get('pending') for turn in session.history):
+        raise ValueError('Wait for pending work or /stop it before changing the investigation.')
+    if argument == 'off':
+        session.investigation = None
+        session.changed()
+        status_message = 'Investigation detached; captured evidence remains in the transcript.'
+        return
+    if argument not in ('', 'next', 'conclude'):
+        session.investigation = investigation.create(argument)
+        session.inspector_token = None
+    state = session.investigation
+    if not state:
+        raise ValueError('Usage: /investigate localhost:3000 (or a symptom containing one host:port)')
+    if argument == 'next':
+        check = investigation.next_check(state, session.history)
+        if not check:
+            status_message = 'Curated checks complete. Use /investigate conclude or start a new investigation to recheck.'
+            return
+        current_input_buffer = '/cmd ' + investigation.command(state, check)
+        input_cursor = len(current_input_buffer)
+        status_message = f'Review the {check} check and press Enter to run. No check has run yet.'
+        return
+    if argument == 'conclude':
+        session.submit('Conclude this connectivity investigation. Give a brief likely cause or say insufficient evidence, '
+                       'cite only supplied [E#] observations, separate facts from hypotheses, and state unresolved questions. '
+                       'Offer a proposed fix only when supported and a read-only verification check. '
+                       'No command is required if evidence is insufficient. Do not execute anything.')
+        return
+    add_local_result(session, '/investigate', investigation.snapshot(state, session.history) +
+                     '\nUse Next Check to review a curated command; Conclude requests an AI report. '
+                     'DNS and TCP checks contact the specified target. No fixes run automatically.')
+    session.history[-1]['investigation_summary'] = state['id']
+    session.changed()
+
+
 def start_command(session, command, token):
     item = next(t for t in session.history if t['token'] == token)
     if item.get('handoff'):
@@ -1723,6 +1777,12 @@ def _query_ollama(messages, index, model, paths, cwd, browse_directory):
     inspector = ''
     if session:
         inspector = session.history[active_position].get('inspector_context', '')
+        investigation_context = session.history[active_position].get('investigation_context', '')
+        if investigation_context:
+            instruction += ('\nInvestigation mode: separate observations from hypotheses; cite only supplied [E#] IDs. '
+                            'Insufficient evidence and no further command needed are valid answers. '
+                            'Never claim a fix succeeded without verification. Commands remain suggestions.\n')
+            inspector = investigation_context
     messages, notice = build_messages(instruction, messages, pins, docs, context, inspector=inspector)
     if docs:
         references = re.findall(r'\[[A-Za-z0-9_.+-]+:L\d+-L\d+\]', messages[0]['content'])
@@ -2382,6 +2442,12 @@ def build_transcript(history, width, saved=False):
                     if len(output_lines) > 18:
                         button(f'Show all {len(output_lines)} lines' if collapsed else 'Collapse output', 'output_toggle', index)
             button('Copy Response', 'copy_response', index)
+            if (not saved and conversation and conversation.investigation
+                    and item.get('investigation_summary') == conversation.investigation['id']):
+                for title, action in [('Next Check', 'next'), ('Conclude', 'conclude'), ('Evidence', '')]:
+                    button(title, 'investigate', action)
+            if item.get('investigation_id'):
+                add('Investigation evidence; transcript turn ' + str(index + 1), CYAN)
             if item.get('doc_references'):
                 add('Sources supplied · ' + ' '.join(item['doc_references']))
             if is_command:
@@ -2401,9 +2467,11 @@ def draw_file_browser(cols, rows):
     assert browser is not None
     click_zones.clear()
     sys.stdout.write(BASE_STYLE + '\033[H\033[2J')
+    draw_pry_header(cols)
+    rows = max(0, rows - 1)
     def put(row, text, color=GREY):
         if 1 <= row <= rows:
-            sys.stdout.write(f'\033[{row};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
+            sys.stdout.write(f'\033[{row+1};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
     put(1, f'Files: {browser["directory"]}', ORANGE)
     put(2, f'Selected: {len(browser["selected"])} paths | Binaries greyed out; text only')
     height = max(0, rows - 6)
@@ -2426,12 +2494,12 @@ def draw_file_browser(cols, rows):
         if reason:
             label += f' (unavailable: {reason})'
         put(offset + 3, label, GREY if reason else CYAN)
-        click_zones[(offset + 3, 1, cols)] = ('browser_entry', index)
+        click_zones[(offset + 4, 1, cols)] = ('browser_entry', index)
     put(rows - 3, BUTTON_STYLE + ' Add Selected (a) ' + BASE_STYLE)
     put(rows - 2, BUTTON_STYLE + ' Use Directory (u) ' + BASE_STYLE)
     if rows >= 6:
-        click_zones[(rows - 3, 1, min(cols, len(' Add Selected (a) ')))] = ('add', 0)
-        click_zones[(rows - 2, 1, min(cols, len(' Use Directory (u) ')))] = ('cwd', 0)
+        click_zones[(rows - 2, 1, min(cols, len(' Add Selected (a) ')))] = ('add', 0)
+        click_zones[(rows - 1, 1, min(cols, len(' Use Directory (u) ')))] = ('cwd', 0)
     put(rows - 1, browser['message'])
     put(rows, 'Go to: ' + browser['path_input'] if browser['path_input'] is not None else 'Up/Down: move | Enter: open | Space: select | Backspace: up | g: path | Esc: close', WHITE)
     sys.stdout.flush()
@@ -2515,6 +2583,36 @@ def hover_overlay(frame):
     return f'\0337\033[{target_row};{left}H' + BASE_STYLE + '\033[7m' + text + BASE_STYLE + '\033[27m\0338'
 
 
+def draw_pry_header(cols, controls=False):
+    color = '\033[38;5;208m'
+
+    def put(col, text, width):
+        sys.stdout.write(f'\033[1;{col}H' + wrap_terminal_line(BASE_STYLE + color + text, width)[0])
+
+    put(1, ' ' * cols, cols)
+    actions = [('Git', 'git'), ('Network', 'network'), ('Sessions', 'sidebar'), ('Files', 'files'), ('Delete', 'delete')]
+    if cols < sum(len(label) + 3 for label, _ in actions) + 25:
+        actions = [('Sessions', 'sidebar'), ('Files', 'files')]
+    if not controls or cols < 40:
+        actions = []
+    right = cols + 1
+    for label, action in reversed(actions):
+        text = f' {label} '
+        start = right - len(text)
+        put(start, text, len(text))
+        click_zones[(1, start, right - 1)] = (action, 0)
+        right = start - 1
+    directory = conversation.cwd if conversation else str(Path.cwd())
+    home = str(Path.home())
+    if directory == home or directory.startswith(home + os.sep):
+        directory = '~' + directory[len(home):]
+    busy = (conversation and conversation.active) or (git_panel and git_panel.busy)
+    activity = 'Working' if busy else 'Ready'
+    if conversation and conversation.investigation:
+        activity += ' / Investigating'
+    put(1, f'Pry | {MODEL_NAME} | {activity} | {directory}', max(1, right - 1))
+
+
 def render_screen():
     """Draw independent chat and bookmark viewports with cell-accurate actions."""
     global scroll_top_index, max_scroll_index, viewport_rows, follow_output
@@ -2530,7 +2628,8 @@ def render_screen():
     cols, rows = max(1, cols), max(1, rows)
     if git_panel is not None:
         sys.stdout.write(git_panel.draw(cols, rows, wrap_terminal_line,
-                                       (BASE_STYLE, GREY, WHITE, CYAN, SELECTED_STYLE)))
+                                       (BASE_STYLE, GREY, WHITE, CYAN, SELECTED_STYLE), top=1))
+        draw_pry_header(cols)
         sys.stdout.flush()
         return
     sys.stdout.write('\033[?25h')
@@ -2581,21 +2680,7 @@ def render_screen():
 
     sys.stdout.write(BASE_STYLE + '\033[H\033[2J')
     if rows >= 2:
-        header_actions = [('Git', 'git'), ('Network', 'network'), ('Sessions', 'sidebar'), ('Files', 'files'), ('Delete', 'delete')]
-        if cols < sum(len(label) + 2 for label, _ in header_actions) + 1:
-            header_actions = [('Sessions', 'sidebar'), ('Files', 'files')]
-        right = cols + 1
-        for label, action in reversed(header_actions):
-            text = f' {label} '
-            start = right - len(text)
-            if start < 1:
-                continue
-            put(1, start, text, len(text), BUTTON_STYLE)
-            click_zones[(1, start, right - 1)] = (action, 0)
-            right = start - 1
-        if right > 1:
-            directory = conversation.cwd if conversation else str(Path.cwd())
-            put(1, 1, f'{MODEL_NAME} · {directory}', right - 1, WHITE)
+        draw_pry_header(cols, controls=True)
     if rows >= 3:
         title = 'Saved conversation' if selected_bookmark else 'Live chat'
         if conversation is not None and not selected_bookmark:
@@ -2675,6 +2760,9 @@ def handle_direct_action(action_type, index):
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, inline_focus, inline_control
     global conversation, session_history, current_input_buffer, input_cursor
     global sidebar_visible, git_panel
+    if action_type == 'investigate':
+        handle_submission('/investigate' + (' ' + index if index else ''))
+        return
     if action_type in ('inspector_clear', 'inspector_change'):
         if conversation is not None:
             if action_type == 'inspector_clear':

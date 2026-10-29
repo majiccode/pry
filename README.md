@@ -153,6 +153,9 @@ accent color. Turn headings distinguish questions, assistant answers, terminal
 output, and local references. The header shows the model, working directory, and
 current conversational focus.
 
+The orange Pry header stays visible in chat, Git, Network, the file browser,
+and the model picker, showing the selected model, activity, and working directory.
+
 Assistant responses render Markdown headings, bold/italic text, inline code,
 links, lists, and quotes directly in the terminal, including while streaming.
 Prose wraps at word boundaries with hanging indents for lists. Tables use aligned
@@ -299,6 +302,10 @@ in chat. Views refresh after operations; use Refresh for changes made externally
 Ahead/behind counts reflect the last fetch. Diffs are previews; staging includes
 the entire selected file, including any preview-truncated content.
 
+Unified diffs show green additions, red removals, old/new line numbers, file and
+hunk headings, and a change-count summary. Long lines wrap with aligned gutters;
+narrow panes omit the number gutter to leave room for the actual changes.
+
 ## Recipes
 
 Click Save Recipe and replace `NAME`, or enter:
@@ -331,7 +338,34 @@ for new fields and interrupted commands are never rerun on restore.
 Clipboard uses pbcopy/pbpaste on macOS, wl-copy/wl-paste on Wayland, then xclip or
 xsel. Install the matching backend if unavailable.
 
-Verification uses syntax checks and manual smoke checks; no test files are added.
+Verification: `python3 -B -m unittest discover` plus syntax and manual smoke checks.
+
+## Guided investigations
+
+Start a focused TCP-connectivity investigation with `/investigate localhost:3000`
+or `/investigate Why is localhost:3000 unreachable?`. Supply exactly one explicit
+host and port; bracket IPv6 addresses, for example `[::1]:3000`.
+
+**Next Check** (or `/investigate next`) loads one curated command into the editor.
+Review it and press Enter to execute. The sequence checks OS name resolution,
+attempts TCP connections, then queries local listeners with `lsof` for loopback
+targets. DNS/TCP checks contact the specified target; no application data is sent.
+Listener visibility depends on permissions. Failed/unavailable checks remain
+evidence, not proof that a service is down. No check or fix runs automatically.
+
+**Evidence** (or `/investigate`) shows captured observations and transcript-turn
+references. **Conclude** (or `/investigate conclude`) asks the selected local model
+for a likely cause, uncertainty, supported fixes, and a verification check, citing
+`[E#]` evidence IDs. These IDs match transcript turn numbers; full output remains
+in the transcript. The model receives short excerpts of the latest result for
+each check, not an unbounded investigation history. Conclusions can be wrong.
+
+Investigation state and evidence survive reopening a session; interrupted checks
+never restart automatically. Rerunning an unchanged curated command updates the
+evidence. Start a new investigation to repeat the guided sequence after changes.
+`/investigate off` detaches the workflow; `/topic` also clears it. Existing output
+remains in the transcript. This version diagnoses TCP reachability only, not HTTP,
+TLS, database health, or arbitrary machine failures.
 
 ## Network browser
 

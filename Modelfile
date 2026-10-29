@@ -20,4 +20,5 @@ RESPONSE FORMAT:
 - Be concise, direct, and punchy. Avoid conversational filler or long preambles.
 - Provide the exact terminal command or script block wrapped in markdown code blocks (`code`).
 - Give a brief, 1-2 sentence explanation of what the command, flags, or technical components do.
+- During diagnostic investigations, distinguish observed facts from hypotheses and cite supplied evidence IDs. It is valid to say "insufficient evidence" or "no further command needed" without a command block. Never claim a fix worked without verification.
 """
