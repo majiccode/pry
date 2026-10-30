@@ -12,6 +12,13 @@ import select
 import re
 import unicodedata
 from pathlib import Path
+
+# Use project dependencies for direct launches, but respect an active environment.
+if __name__ == '__main__' and sys.prefix == sys.base_prefix:
+    project_python = Path(__file__).resolve().parent / '.venv' / 'bin' / 'python'
+    if project_python.is_file() and os.access(project_python, os.X_OK):
+        os.execv(str(project_python), [str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
 from datetime import datetime, timezone
 from uuid import uuid4
 import tempfile
@@ -40,6 +47,7 @@ from storage_panel import StoragePanel
 from watches import WatchEngine
 from watches_panel import WatchesPanel
 from scratchpad_panel import ScratchpadPanel
+from synth_panel import SynthPanel
 from spotlight_search import SpotlightSearch
 from terminal_zoom import TerminalZoom
 from response_rendering import render_markdown
@@ -78,7 +86,7 @@ session_delete_pending = None
 PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
                ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
                ('Models', '/models'), ('Sessions', '/bookmarks'), ('Scratchpad', '/notes'),
-               ('Changes', '/changes'), ('Storage', '/storage')]
+               ('Changes', '/changes'), ('Storage', '/storage'), ('Chiptune', '/synth')]
 BLACK_BG, ORANGE, CYAN = BACKGROUND, ACCENT, SECONDARY
 GREY, WHITE, LIGHT_ORANGE = MUTED, TEXT, WARNING
 BASE_STYLE, SELECTED_STYLE = BASE, SELECTED
@@ -484,6 +492,7 @@ COMMANDS = [('/new', 'Start a new conversation'),
             ('/exit', 'Exit the app (alias)')]
 COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>'),
              ('/notes', 'Open the persistent Markdown scratchpad'),
+             ('/synth', 'Chiptune tracker, instruments, envelopes and live spectrum'),
              ('/panels', 'Choose a workspace from the Panels menu'),
              ('/watch', 'Configure port, process, disk and log watches'),
              ('/services', 'Browse services and prepare start/stop commands'),
@@ -1348,7 +1357,11 @@ def handle_submission(text):
                 git_panel = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
                                            clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                            open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
-                                           shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
+                                            shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
+            elif verb == '/synth':
+                if argument:
+                    raise ValueError('Use /synth without arguments; choose examples inside the panel.')
+                git_panel = SynthPanel(settings_path().parent / 'synth.json')
             elif verb == '/watch':
                 if watch_engine is None:
                     raise ValueError('Watches unavailable; check the work directory and restart.')
@@ -3144,6 +3157,7 @@ def draw_pry_header(cols, controls=False):
         if running or triggered:
             watching = f' | {running} watches / {triggered} alerts'
     workspace = ('Scratchpad' if isinstance(git_panel, ScratchpadPanel) else
+                 'Chiptune' if isinstance(git_panel, SynthPanel) else
                  'Watches' if isinstance(git_panel, WatchesPanel) else
                  'Services' if isinstance(git_panel, ServicesPanel) else
                  'Changes' if isinstance(git_panel, ChangesPanel) else
@@ -3251,6 +3265,9 @@ def choose_panel(index):
         git_panel.message = status_message
         return
     if isinstance(git_panel, ScratchpadPanel) and not git_panel.save_position():
+        status_message = git_panel.message
+        return
+    if isinstance(git_panel, SynthPanel) and not git_panel.close():
         status_message = git_panel.message
         return
     git_panel, browser, model_picker = None, None, None
@@ -4029,6 +4046,8 @@ def main():
                 redraw_screen()
                 
     finally:
+        if isinstance(git_panel, SynthPanel):
+            git_panel.close()
         if isinstance(git_panel, ScratchpadPanel):
             git_panel.save_position()
         if watch_engine is not None:

@@ -583,10 +583,68 @@ Verification uses syntax checks and manual smoke checks.
 ## Panels menu
 
 The orange header has one **Panels** dropdown for Chat, Git, Network, Services,
-Watches, Files, Models, Sessions, Scratchpad, Changes, and Storage. Click it from any screen, or type `/panels`
+Watches, Files, Models, Sessions, Scratchpad, Changes, Storage, and Chiptune. Click it from any screen, or type `/panels`
 in chat. Up/Down or Tab selects a destination; Enter opens it; Esc dismisses it.
 Switching panels preserves your chat draft. Finish or cancel an active panel job
 before switching. The header shows active-watch and alert counts when present.
+
+## Chiptune
+
+Open **Panels > Chiptune** or `/synth` for **Circuit**, a four-channel softsynth
+and tracker. Editing and saving work without audio packages. Install optional
+audio dependencies into the Python environment that runs Pry:
+
+```sh
+python3 -m pip install -r requirements-audio.txt
+```
+
+When a project-local `.venv` exists, `python3 ai-tool.py` automatically launches
+with its Python. An already active virtual environment is respected. Restart Pry
+after installing dependencies or creating the environment.
+
+Live playback uses sounddevice / PortAudio. If the audio backend is unavailable,
+macOS users can install it with `brew install portaudio`; Linux users may need
+their distribution's PortAudio package (for example `libportaudio2` on Debian).
+WAV export needs NumPy but no audio device. Dependency/device errors appear in
+the panel, not at app startup.
+
+Start with **Examples** (Ctrl+E): Copper Comet, Pocket Observatory, and Rain on
+the Arcade are original two-pattern tunes with lead, bass, kick, and noise
+percussion instruments. Loading an example requires confirmation and saves the
+previous project to a unique JSON backup first. A new workspace starts blank.
+
+- **Space** plays/stops; **Esc** saves, stops audio, and closes. **?** opens help.
+- **Tab** switches tracker/editor. Wide terminals show both; narrow terminals
+  show the selected view. Buttons and tracker cells support mouse clicks.
+- Tracker arrows select row/channel. `z s x d c v g b h n j m` enter the twelve
+  chromatic notes beginning at C4. `[` / `]` change octave; `+` / `-` select the
+  instrument; Enter auditions. Note entry advances one row.
+- `.` inserts note-off; Delete/Backspace clears a cell. Empty cells sustain the
+  previous note. Each row is a sixteenth note.
+- Editor Up/Down selects a field; Left/Right adjusts it. Enter edits names,
+  title, or pattern order, or auditions the instrument on other fields.
+- Instruments offer sine, triangle, saw, square/pulse, and noise oscillators,
+  tuning, volume, pulse width, and low-pass cutoff. Select an envelope target
+  to edit its attack, decay, sustain, release, and modulation depth. Targets are
+  volume, pitch (semitones), cutoff (Hz), and pulse width.
+- **New I** / **Copy I** create instruments. **Add P** / **Dup P** create patterns;
+  **Order** specifies playback using space-separated, one-based pattern numbers.
+  Pattern lengths are 16, 32, or 64 rows; shortening requires confirmation.
+- **Loop**, **Mute**, and **Solo** affect the next playback snapshot. Stop and
+  replay to hear edits. Ctrl+N creates an instrument, Ctrl+U mutes the selected
+  channel, Ctrl+O solos, Ctrl+P duplicates a pattern, and Ctrl+L toggles looping.
+- **WAV** / Ctrl+W exports mono 22050 Hz, 16-bit PCM, including release tails.
+  Existing exports require overwrite confirmation. Live waveform and FFT strips
+  visualize actual audio sent to the device.
+
+Projects autosave atomically to `~/.ai-tool/synth.json` (or
+`$AI_TOOL_WORKDIR/synth.json`); UI selection lives in `pry-state.json`. Ctrl+S
+retries failed saves. External changes are never silently overwritten; closing
+with conflicting memory edits offers a separate recovered JSON file. WAV export
+uses the same project basename. Songs are limited to four monophonic channels,
+32 instruments, 16 patterns, 64 order entries, and 120 seconds including release.
+Rendering runs in a worker; canceling prevents audio from starting afterward.
+Closing waits for an in-progress render and releases the output device.
 
 ## Storage
 

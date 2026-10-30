@@ -1,0 +1,3 @@
+# Optional dependencies for /synth playback, visualization, and WAV export.
+numpy>=1.24
+sounddevice>=0.4.6
