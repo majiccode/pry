@@ -39,6 +39,7 @@ from watches import WatchEngine
 from watches_panel import WatchesPanel
 from scratchpad_panel import ScratchpadPanel
 from spotlight_search import SpotlightSearch
+from terminal_zoom import TerminalZoom
 from response_rendering import render_markdown
 from file_preview import render_file_preview
 import investigation
@@ -68,6 +69,9 @@ watch_engine = None
 panels_menu = None
 panels_query = ''
 about_open = False
+terminal_zoom = TerminalZoom()
+zoom_notice = ''
+zoom_notice_until = 0
 session_delete_pending = None
 PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
                ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
@@ -287,6 +291,9 @@ class BookmarkStore:
         for saved_turn, turn in zip(snapshot, history):
             if turn.get('kind') == 'command':
                 saved_turn['kind'] = 'command'
+                for key in ('cwd', 'exit_code', 'log_path', 'interactive'):
+                    if key in turn:
+                        saved_turn[key] = turn[key]
         for saved in self.items:
             if saved['history'] == snapshot:
                 return saved
@@ -1282,6 +1289,38 @@ def handle_completion_event(event, value):
     return False
 
 
+def handle_workspace_tab(event, value):
+    """Toggle chat/notes before completion and editor input consume plain Tab."""
+    global git_panel, status_message
+    if event != 'key' or value != '\t':
+        return False
+    if about_open or panels_menu is not None or main_search.active or browser is not None or model_picker is not None:
+        return False
+    if isinstance(git_panel, ScratchpadPanel):
+        if git_panel.search.active or git_panel.graph_focus is not None or git_panel.inspector.focus is not None:
+            return False
+        if git_panel.capture_job is not None:
+            git_panel.message = 'Capture running | Ctrl+C cancel before leaving Notes'
+            return True
+        if git_panel.dirty:
+            git_panel.save()
+        if git_panel.dirty or not git_panel.save_position():
+            status_message = git_panel.message
+            return True
+        git_panel = None
+    elif git_panel is None:
+        try:
+            git_panel = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
+                                       clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
+                                       open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
+                                       shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
+        except (OSError, ValueError) as exc:
+            status_message = f'Could not open notes: {exc}'
+    else:
+        return False
+    return True
+
+
 def handle_submission(text):
     """Handle local commands, returning False when the app should exit."""
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, current_input_buffer
@@ -1302,7 +1341,8 @@ def handle_submission(text):
             elif verb == '/notes':
                 git_panel = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
                                            clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
-                                           open_url=webbrowser.open)
+                                           open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
+                                           shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
             elif verb == '/watch':
                 if watch_engine is None:
                     raise ValueError('Watches unavailable; check the work directory and restart.')
@@ -1426,9 +1466,9 @@ def handle_submission(text):
                 recipe_command(verb, argument)
             elif verb == '/keys':
                 add_local_result(conversation, text, 'Ctrl+P/N: previous/next input | Ctrl+R: retry | Ctrl+C: stop active work, otherwise exit\n'
-                                 'Tab/Shift+Tab: inspector focus | Alt+Enter: newline | PageUp/Down: scroll\n'
+                                  'Tab: AI / Notes | Shift+Tab: inspector focus | Alt+Enter: newline | PageUp/Down: scroll\n'
                                  'Ctrl+K: searchable workspaces | Ctrl+B or /sidebar: toggle sessions\n'
-                                 'Command cards: Edit, Run, More (extra actions). Tab completes slash commands.\n'
+                                  'Command cards: Edit, Run, More (extra actions). Enter completes and runs slash commands.\n'
                                  'Use {{name}} as an unquoted whole-word recipe parameter.\n'
                                  '/recipe shows workflow syntax. /search filters saved sessions. /doctor checks setup.')
         except (OSError, ValueError, TypeError) as exc:
@@ -1683,6 +1723,9 @@ def read_input_event(fd):
     if sequence in keys:
         return keys[sequence]
     if prefix == b'[':
+        cell = re.fullmatch(rb'6;(\d+);(\d+)t', sequence)
+        if cell:
+            return ('cell_size', (int(cell[1]), int(cell[2])))
         navigation_key = re.fullmatch(rb'1;(\d+)([ABCDHF])', sequence)
         if navigation_key:
             bits = int(navigation_key[1]) - 1
@@ -1704,6 +1747,8 @@ def read_input_event(fd):
                 return ('ignore', None)
             bits = modifier - 1
             command, control, shift = bool(bits & (8 | 32)), bool(bits & 4), bool(bits & 1)
+            if command and code in (43, 61, 45, 48):
+                return ('zoom', {43: 'in', 61: 'in', 45: 'out', 48: 'reset'}[code])
             if command or control:
                 letter = chr(code).lower() if 0 <= code <= 0x10ffff else ''
                 shortcuts = {'a': '\x01', 'c': '\x03', 'x': '\x18', 'v': '\x16',
@@ -2480,12 +2525,13 @@ def focused_inline():
 
 def poll_live_inspectors():
     """Refresh opted-in process snapshots without blocking terminal input."""
-    if conversation is None:
+    if conversation is None or git_panel is not None or model_picker is not None or selected_bookmark:
         return
+    visible_indices = set(inline_screen_regions.values())
     now = time.monotonic()
-    for item in conversation.history:
+    for index, item in enumerate(conversation.history):
         view = item.get('_inline', {})
-        if view.get('live') and not view.get('paused') and not view.get('collapsed') and not view.get('loading') and now >= view.get('next_refresh', 0):
+        if index in visible_indices and view.get('live') and not view.get('paused') and not view.get('collapsed') and not view.get('loading') and now >= view.get('next_refresh', 0):
             view['next_refresh'] = now + 3
             previous_selection = getattr(conversation, 'inspector_token', None)
             inline_action(item, 'refresh')
@@ -2615,7 +2661,7 @@ def handle_inline_event(event, value):
     return False
 
 
-def build_transcript(history, width, saved=False):
+def build_transcript(history, width, saved=False, viewport=None):
     """Build physical rows and matching hitboxes using the same wrap width."""
     lines, zones = [], {}
     inline_tab_stops.clear()
@@ -2745,12 +2791,13 @@ def build_transcript(history, width, saved=False):
         content = []
         if page.get('file_preview'):
             # Keep presentation caches in the transient view, never saved pages.
-            cache_key = (page.get('text', ''), dict(page['file_preview']), width, view.get('filter', ''))
+            preview_window = None if viewport is None else (viewport[0] - len(lines) - 1, viewport[1] - len(lines) - 1)
+            cache_key = (page.get('text', ''), dict(page['file_preview']), width, view.get('filter', ''), preview_window)
             cache = view.get('_file_render_cache')
             if cache is None or cache[0] != cache_key:
                 summary, preview_rows = render_file_preview(
                     cache_key[0], cache_key[1], max(1, width - 2),
-                    wrap_terminal_line, cache_key[3])
+                    wrap_terminal_line, cache_key[3], viewport=preview_window)
                 content = [(physical, None) for physical in preview_rows]
                 view['_file_render_cache'] = (cache_key, summary, content)
             else:
@@ -2759,22 +2806,34 @@ def build_transcript(history, width, saved=False):
                 content = list(content)
             add(summary)
         else:
+            from terminal_layout import wrapped_height
             for line in page.get('text', '').splitlines():
                 if view.get('filter') and view['filter'].casefold() not in line.casefold():
                     continue
-                for physical in wrap_terminal_line(line, max(1, width - 2)):
-                    content.append((physical, None))
+                count = wrapped_height(line, max(1, width - 2))
+                first = len(lines) + len(content)
+                visible = viewport is None or first < viewport[1] and first + count > viewport[0]
+                content.extend((physical, None) for physical in
+                               (wrap_terminal_line(line, max(1, width - 2)) if visible else [line] * count))
         for entry in page.get('entries', []):
             if view.get('filter') and view['filter'].casefold() not in entry['label'].casefold():
                 continue
             label = ' '.join(entry['label'].split())
-            content.extend((physical, entry['target']) for physical in wrap_terminal_line(label, max(1, width - 2)))
+            from terminal_layout import wrapped_height
+            count = wrapped_height(label, max(1, width - 2))
+            first = len(lines) + len(content)
+            visible = viewport is None or first < viewport[1] and first + count > viewport[0]
+            content.extend((physical, entry['target']) for physical in
+                           (wrap_terminal_line(label, max(1, width - 2)) if visible else [label] * count))
         height = max(1, len(content))
         view.update(content=content, height=height, content_row=len(lines))
         view['cursor'] = max(0, min(view.get('cursor', 0), len(content) - 1))
         first = view['offset'] = 0
         for position, (label, target) in enumerate(content[first:first + height], first):
             row = len(lines)
+            if viewport is not None and not viewport[0] <= row < viewport[1]:
+                lines.append('')
+                continue
             selected = position == view['cursor'] and item.get('token') == inline_focus and inline_control == 'focus'
             prefix = '> ' if selected else '  '
             if width < 3:
@@ -2868,6 +2927,7 @@ def build_transcript(history, width, saved=False):
                     if len(output_lines) > 18:
                         button(f'Show all {len(output_lines)} lines' if collapsed else 'Collapse output', 'output_toggle', index)
             button('Copy Response', 'copy_response', index)
+            button('Send to note', 'send_to_note', index)
             if (not saved and conversation and conversation.investigation
                     and item.get('investigation_summary') == conversation.investigation['id']):
                 for title, action in [('Next Check', 'next'), ('Conclude', 'conclude'), ('Evidence', '')]:
@@ -3041,8 +3101,12 @@ def draw_pry_header(cols, controls=False):
         sys.stdout.write(f'\033[1;{col}H' + wrap_terminal_line(BASE_STYLE + PANEL + color + text, width)[0])
 
     put(1, ' ' * cols, cols)
-    actions = [('Panels ^K', 'panels')] if cols >= 20 else []
+    actions = []
+    if cols >= 20:
+        actions.extend([('−', 'zoom_out'), (terminal_zoom.label, 'zoom_reset'), ('+', 'zoom_in')])
     if cols >= 40:
+        actions.append(('Panels ^K', 'panels'))
+    if cols >= 52:
         actions.append(('About', 'about'))
     right = cols + 1
     for label, action in reversed(actions):
@@ -3086,7 +3150,7 @@ def draw_pry_header(cols, controls=False):
                 tail, used = unit + tail, used + last - first + 1
             directory = '...' + tail
         label += ' | ' + directory
-    put(1, label, available, ORANGE)
+    put(1, ' ' + zoom_notice if zoom_notice else label, available, ORANGE)
 
 
 def draw_about_modal():
@@ -3227,7 +3291,9 @@ def render_screen():
     chat_width = cols - sidebar_width - 1 if sidebar_width else cols
     chat_screen_width = chat_width
     history = selected_bookmark['history'] if selected_bookmark else session_history
-    lines, zones = build_transcript(history, chat_width, selected_bookmark is not None)
+    initial_scroll = scroll_top_index
+    window = None if main_search.active else (initial_scroll, initial_scroll + height)
+    lines, zones = build_transcript(history, chat_width, selected_bookmark is not None, viewport=window)
     main_search_rows = lines
     max_scroll_index = max(0, len(lines) - height)
     saved_items = visible_bookmarks()
@@ -3244,6 +3310,10 @@ def render_screen():
             follow_output = False
     scroll_top_index = max_scroll_index if follow_output else min(scroll_top_index, max_scroll_index)
     scroll_top_index = max(0, scroll_top_index)
+    if window is not None and scroll_top_index != initial_scroll:
+        lines, zones = build_transcript(history, chat_width, selected_bookmark is not None,
+                                       viewport=(scroll_top_index, scroll_top_index + height))
+        main_search_rows = lines
     if scroll_top_index == max_scroll_index and not main_search.active:
         follow_output = True
     bookmark_scroll_index = min(bookmark_scroll_index, bookmark_max_scroll)
@@ -3312,7 +3382,7 @@ def render_screen():
                 SELECTED_STYLE if index == selected else ORANGE)
     if rows >= 3:
         mode = 'RUN / terminal handoff' if current_input_buffer.startswith('/run ') else 'CMD / capture output' if current_input_buffer.startswith('/cmd ') else 'ASK / local AI'
-        hint = ' Up/Down choose | Tab complete | Enter run | Esc dismiss' if matches else f' {mode}  |  Enter send  Alt+Enter newline  ^K panels'
+        hint = ' Up/Down choose | Enter run | Tab notes | Esc dismiss' if matches else f' {mode}  |  Enter send  Tab notes  Alt+Enter newline  ^K panels'
         put(input_start - 1 - attachment_height, 1, hint.ljust(cols), cols, PANEL + ORANGE)
     if attachment_height:
         row = input_start - 1
@@ -3339,6 +3409,12 @@ def render_screen():
     sys.stdout.write(f'\033[{input_start + cursor_row - draft_first};{prefix_width + cursor_col + 1}H')
     sys.stdout.flush()
 
+def handle_zoom(action):
+    global status_message, zoom_notice, zoom_notice_until
+    status_message = zoom_notice = terminal_zoom.request(action)
+    zoom_notice_until = time.monotonic() + 8
+
+
 def handle_direct_action(action_type, index):
     """Open saved transcripts or act on a command in the visible transcript."""
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, inline_focus, inline_control
@@ -3348,6 +3424,9 @@ def handle_direct_action(action_type, index):
     if about_open:
         if action_type == 'about_close':
             about_open = False
+        return
+    if action_type in ('zoom_in', 'zoom_out', 'zoom_reset'):
+        handle_zoom(action_type[5:])
         return
     if action_type == 'about':
         about_open = True
@@ -3534,6 +3613,18 @@ def handle_direct_action(action_type, index):
     if not 0 <= index < len(history):
         return
     item = history[index]
+    if action_type == 'send_to_note':
+        try:
+            notes = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
+                                   clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
+                                   open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
+                                   shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
+            notes.receive_result(item)
+            git_panel = notes
+            status_message = notes.message if notes.dirty else 'Result sent to Notes.'
+        except (OSError, ValueError) as exc:
+            status_message = f'Could not send result to Notes: {exc}'
+        return
     if action_type == 'copy_response':
         status_message = 'Copied response to clipboard.' if copy_to_clipboard(item['response']) else 'Clipboard unavailable (Linux requires xclip).'
         return
@@ -3623,6 +3714,7 @@ def main():
     global current_input_buffer, input_cursor, follow_output, active_pane, mouse_selection, mouse_press, inline_focus
     global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover, panels_menu, panels_query
     global about_open
+    global zoom_notice, zoom_notice_until
     
     if len(sys.argv) > 1 or not sys.stdin.isatty() or not sys.stdout.isatty():
         try:
@@ -3645,6 +3737,18 @@ def main():
         about_mouse_release = False
         while True:
             updated = process_results()
+            zoom_message = terminal_zoom.poll()
+            if zoom_message:
+                status_message = zoom_notice = zoom_message
+                zoom_notice_until = time.monotonic() + 8
+                updated = True
+            if zoom_notice and time.monotonic() >= zoom_notice_until:
+                zoom_notice = ''
+                updated = True
+            query = terminal_zoom.measurement_request()
+            if query:
+                sys.stdout.write(query)
+                sys.stdout.flush()
             poll_live_inspectors()
             if watch_engine is not None:
                 try:
@@ -3668,6 +3772,17 @@ def main():
             event, value = read_input_event(fd)
             if event == 'eof':
                 break
+            if event == 'cell_size':
+                if terminal_zoom.observe_cell(*value):
+                    redraw_screen()
+                continue
+            if event == 'zoom':
+                handle_zoom(value)
+                redraw_screen()
+                continue
+            if handle_workspace_tab(event, value):
+                redraw_screen()
+                continue
             if about_mouse_release and event in ('drag', 'release'):
                 if event == 'release':
                     about_mouse_release = False
@@ -3906,8 +4021,12 @@ def main():
                 pass
         if git_panel is not None:
             git_panel.cancel.set()
+            if isinstance(git_panel, ScratchpadPanel) and git_panel.capture_job is not None:
+                git_panel.capture_job.cancel()
             if git_panel.thread is not None:
                 git_panel.thread.join(timeout=3)
+            if isinstance(git_panel, ScratchpadPanel):
+                git_panel.poll()
         jobs = list(command_jobs.values())
         for job in jobs:
             job.cancel()

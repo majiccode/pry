@@ -30,7 +30,7 @@ def preview_metadata(path, text, start=1, highlight=None):
                 start=start, highlight=highlight, total_lines=len(text.splitlines()))
 
 
-def render_file_preview(text, metadata, width, wrap, filter_text=''):
+def render_file_preview(text, metadata, width, wrap, filter_text='', viewport=None):
     """Return a summary and numbered physical rows within the available width."""
     width = max(1, width)
     language = LANGUAGES.get(Path(metadata['name']).suffix.lower(), 'Text')
@@ -73,7 +73,14 @@ def render_file_preview(text, metadata, width, wrap, filter_text=''):
             continue
         number = start + offset
         # Expand tabs relative to source column, not the line-number gutter.
-        physical = wrap(style(line.expandtabs(4)), body_width)
+        expanded = line.expandtabs(4)
+        from terminal_layout import wrapped_height
+        count = wrapped_height(expanded, body_width)
+        visible = viewport is None or len(rows) < viewport[1] and len(rows) + count > viewport[0]
+        if not visible:
+            rows.extend([''] * count)
+            continue
+        physical = wrap(style(expanded), body_width)
         for index, part in enumerate(physical):
             prefix = ''
             if gutter:

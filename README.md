@@ -170,6 +170,30 @@ and context budgeting. Model responses never execute commands automatically.
 
 ## Commands and keys
 
+### Workspace zoom
+
+The header’s **− / percentage / +** controls change the terminal font size for
+the whole workspace, including the notes editor. Click the percentage to reset
+to the terminal’s configured default font size. On macOS, the terminal’s native
+**Cmd +** (or **Cmd =**), **Cmd −**, and **Cmd 0** shortcuts also work.
+
+The percentage is measured from character-cell height relative to when Pry
+starts (100%), and follows native keyboard zoom changes. It may be approximate
+due to pixel rounding. `--%` means the terminal has not reported its cell size.
+Reset can differ from 100% if Pry started in an already-zoomed terminal.
+Zoom controls appear at widths of 20 columns or more.
+
+- **Ghostty on macOS:** clickable zoom requires Ghostty 1.3+ with AppleScript
+  support enabled. Allow terminal automation if macOS prompts. Pry targets its
+  own terminal pane by TTY.
+- **iTerm2 on macOS:** install `iterm2` into the Python environment running Pry
+  (`python3 -m pip install iterm2`) and enable **Settings → General → Magic →
+  Enable Python API**. Pry changes the current session’s font, leaving the saved
+  profile intact.
+- **Other terminals, SSH, tmux, and screen:** use the host terminal’s native zoom
+  shortcuts. Percentage reporting depends on terminal support for cell-size
+  queries and whether the multiplexer forwards them.
+
 Follow-up questions use the preceding command output or AI response as context.
 Local results such as `/docs rsync`, `/recipe show NAME`, and `/doctor` also
 become conversational context. Questions submitted while documentation is loading
@@ -198,8 +222,13 @@ of your filesystem or a command that runs without your action.
 
 `/help` lists commands; `/keys` shows shortcuts. Ctrl+P/N recalls input, Ctrl+R
 retries the last AI question, Ctrl+C stops active work (otherwise exits).
-Alt+Enter inserts a newline. Tab completes slash commands, otherwise Tab/Shift+Tab
-moves inspector focus. **Ctrl+K** opens the searchable workspace switcher from any
+Alt+Enter inserts a newline. **Tab switches between AI chat and Notes**, preserving
+your chat draft and saving notes and their cursor/scroll position before switching.
+If saving fails, Notes stays open with the error visible. Tab takes priority over
+slash-command completion and notes indentation; Enter completes and runs a selected
+slash command. Shift+Tab moves inspector focus. Search, graph controls, menus, forms,
+and other workspaces retain their own Tab navigation.
+**Ctrl+K** opens the searchable workspace switcher from any
 screen; type a workspace name, use arrows to select, and Enter to open it.
 
 ### Terminal-native interface
@@ -259,6 +288,48 @@ This UI state lives in `~/.ai-tool/pry-state.json` (or
 Type `/new` on its own line and press Enter to insert a divider below the previous
 note, a **New Note** heading, and a local start timestamp. The title is selected;
 type to replace it, then press Enter to continue writing below the date.
+
+Each `##` note section has a clickable **▾ / ▸** gutter control. **Ctrl+E**
+expands or collapses the section or pasted block at the caret. Sections created
+with `/new` fold independently; headings inside code or pasted blocks do not
+start new sections. Fold state survives panel switching and restarting Pry.
+
+Pastes longer than **10 lines or 1,000 characters** start as collapsed blocks
+with a preview and line count. Click the preview or press Ctrl+E to expand.
+Searching reveals matching hidden text, and editing hidden content expands it.
+The full content stays in `notes.md`; fold state is stored in `pry-state.json`.
+External file edits invalidate stale fold ranges instead of hiding unrelated text.
+
+Pasted JSON objects and arrays are formatted with two-space indentation in a
+`json` code fence and syntax-highlighted. Large JSON also folds automatically.
+Numbers, duplicate keys, and string escapes are preserved; invalid JSON stays
+as pasted. Formatting and insertion undo together with Ctrl+Z.
+
+In Notes, type `/capture git status --short` on a line and press Enter to run a
+command in Pry's current working directory. The background capture leaves the
+editor responsive and replaces that line with a timestamped snapshot containing
+the command, directory, combined stdout/stderr, exit status, and duration. Long
+snapshots start folded. **Ctrl+C** cancels a running capture and records the
+cancellation; wait for completion or cancel before leaving Notes. `/capture`
+without a command shows a usage hint. Each invocation creates a fresh snapshot.
+
+Completed AI responses, references, and terminal results have a **Send to note**
+button beside Copy Response. It opens Notes and inserts the result at your saved
+caret, preserving your chat draft. Command results include the command and working
+directory. JSON formatting and large-output folding apply as with paste; **Ctrl+Z**
+undoes the entire insertion.
+
+Compatible command blocks from `/capture` or **Send to note** show **Inspect**
+inside Notes. Click it to browse the existing file, Git, process, JSON/HTTP, and
+other supported inspectors in place. Use **↑/↓** to select, **Enter/→** to open,
+**←/Backspace** to go back (or up a directory at the Files root),
+**PgUp/PgDn** or the wheel to scroll. The navigator replaces the output inside
+its code fence while open. **Esc** returns to editing and autosaves the entire
+current view (including its location), replacing the previous output in that
+same fence. Command metadata stays outside the fence. **Ctrl+Z** restores the
+previous snapshot; **Inspect** resumes from the saved view, including after
+reopening Notes. Inspector metadata moves with preceding edits; editing a
+captured block removes its stale inspector, and undo restores it.
 
 **Ctrl+F** opens a floating, Spotlight-style search box. Matches are literal and
 case-insensitive; typing jumps to a match, Enter/Down advances, and Up/Shift+Tab
@@ -365,7 +436,7 @@ Cancellation targets the captured command process group, including child process
 
 ### Interactive inspectors and AI questions
 
-Recognized command output opens an inline inspector. Use Tab / Shift+Tab to
+Recognized command output opens an inline inspector. Use Shift+Tab to
 focus its controls, arrows to select entries, Enter to inspect, Left/Back to
 return, and Esc to return to the question editor. Clickable controls provide
 Refresh, Filter, Copy, Explain, and Add observations to context. Filter matches

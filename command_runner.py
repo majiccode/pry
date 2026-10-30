@@ -90,7 +90,8 @@ class CommandJob:
             text = output + f'\nExit status: {code}' + (f'\n{reason}' if reason else '')
             text += f'\nFull output: {log}'
             self.callback('done', dict(text=text, stdout=output, cwd=directory,
-                                      exit_code=code, log_path=str(log), duration=time.monotonic() - started))
+                                      exit_code=code, log_path=str(log), duration=time.monotonic() - started,
+                                      reason=reason))
         except Exception as exc:
             if self.process is not None:
                 self._signal(signal.SIGKILL)
