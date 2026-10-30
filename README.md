@@ -583,10 +583,80 @@ Verification uses syntax checks and manual smoke checks.
 ## Panels menu
 
 The orange header has one **Panels** dropdown for Chat, Git, Network, Services,
-Watches, Files, Models, and Sessions. Click it from any screen, or type `/panels`
+Watches, Files, Models, Sessions, Scratchpad, Changes, and Storage. Click it from any screen, or type `/panels`
 in chat. Up/Down or Tab selects a destination; Enter opens it; Esc dismisses it.
 Switching panels preserves your chat draft. Finish or cancel an active panel job
 before switching. The header shows active-watch and alert counts when present.
+
+## Storage
+
+Open **Panels > Storage** or `/storage` to scan the session's current folder.
+Summary cards show current-folder size, scanned total, coverage, and exclusions/errors.
+The size-ranked list includes proportional bars and percentages of the displayed
+folder's total. Enter or click a folder to drill down instantly using the cached
+scan; **Parent** and **Scanned root** navigate back. **Largest files** ranks regular
+files across the entire scanned root. **Choose path** scans another directory;
+relative paths resolve against the session folder when this panel was created.
+
+**Scan details** explains coverage and errors. Scans are read-only and use Python's
+standard library, with no external tools or additional dependencies. They stop at
+50,000 entries or a cooperative 10-second limit; partial results are clearly marked.
+Symlinks, nested mounts, and special files are excluded. Sizes are logical file
+lengths, not allocated disk usage: hardlinks count per path, and sparse files,
+compression, clones, and filesystem overhead can make physical usage differ.
+There are no delete or cleanup actions.
+
+## Changes
+
+Open **Panels > Changes** or `/changes`. Choose **Take baseline**, make changes
+outside the panel, then choose **Compare**. The baseline stays fixed until you
+explicitly confirm a replacement. The default **This Machine** scope captures
+files, visible processes, TCP listeners, and supported service-manager observations.
+It is a machine comparison, not a complete disk audit or continuous event recorder.
+
+Clickable category cards show `+ new`, `~ changed`, and `- no longer observed` counts.
+Overview prioritizes port, service and process events before file changes. Tabs
+separate Files, Processes, Ports, Services, and Coverage; keys 1-6 choose views.
+**Status** cycles All/Added/Modified/Removed filtering. Enter or click an entry for
+captured before/after evidence and colored file diffs where available. TCP listener
+details include owning processes and their captured start identities where visible.
+CPU/memory counters and directory timestamp changes are ignored to reduce noise.
+
+The machine file scope includes home (including `~/tmp`), canonical `/etc`, and
+macOS launchd configuration directories. **File scope** accepts `machine` or a
+custom folder path, clearing all baselines after Apply. Process, port and service
+categories remain machine-wide even with a custom file scope. Files are scanned
+breadth-first. Coverage lists the exact roots, exclusions, limits, and source gaps.
+Excluded names include `.git`, `node_modules`, Python environments/caches, `.cache`,
+`.Trash`, and known credential directories (`.ssh`, `.gnupg`, `.aws`, `.kube`).
+Selected home Library cache/log/developer/container/metadata subtrees are excluded.
+Symlinks and detected nested mounts are not traversed; special files are never
+opened. Other files can still contain secrets; exclusions are not a secret filter.
+
+File scans are limited to 100,000 entries/20 seconds per root and 200,000 entries/
+60 seconds overall, with depth 64. Hashing is bounded to 1 MiB/file and 32 MiB/root;
+other regular files use metadata-only detection, which can miss same-size edits
+with restored timestamps. Captured UTF-8 text is limited to 32 KiB/file and 1 MiB/root.
+Incomplete file scans retain useful observations but compare only outside blocked
+paths from BOTH captures, so inaccessible or unscanned paths never imply removals.
+
+System categories use installed tools, with no added Python dependencies:
+`ps`, Linux `ss` or `lsof`, macOS current-user `launchctl` and optional Homebrew,
+or Linux user/system `systemctl`. Linux service enablement is collected separately
+from loaded-unit status; macOS enablement and system launchd state are not collected.
+Each command has a 10-second/4 MiB limit. Missing tools, parsing failures, permission
+errors and truncated sources are not compared, independently of other sources.
+Unavailable ownership suppresses owner-change inference. Process identities use PID
+plus second-resolution start time; discovery helper processes are excluded.
+Missing processes/listeners mean **no longer observed**, not proven exit/closure.
+There is no sudo, restoration, automatic AI request, or background polling.
+
+Both panels support Ctrl+F search, keyboard/mouse navigation, and Ctrl+C scan
+cancellation. Cancellation is cooperative between filesystem calls. Snapshots are
+not atomic and files may change during scanning. Results and captured text stay
+in memory for the current application session and are retained when switching
+panels, separately for each conversation and starting folder; they are not saved
+to disk. Esc hides details first, then closes the panel.
 
 ## Watches
 

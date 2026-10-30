@@ -35,6 +35,8 @@ from model_providers import validate_profile, stream_chat, DEFAULT_SYSTEM
 from git_panel import GitPanel
 from network_panel import NetworkPanel
 from services_panel import ServicesPanel
+from changes_panel import ChangesPanel
+from storage_panel import StoragePanel
 from watches import WatchEngine
 from watches_panel import WatchesPanel
 from scratchpad_panel import ScratchpadPanel
@@ -75,7 +77,8 @@ zoom_notice_until = 0
 session_delete_pending = None
 PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
                ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
-               ('Models', '/models'), ('Sessions', '/bookmarks'), ('Scratchpad', '/notes')]
+               ('Models', '/models'), ('Sessions', '/bookmarks'), ('Scratchpad', '/notes'),
+               ('Changes', '/changes'), ('Storage', '/storage')]
 BLACK_BG, ORANGE, CYAN = BACKGROUND, ACCENT, SECONDARY
 GREY, WHITE, LIGHT_ORANGE = MUTED, TEXT, WARNING
 BASE_STYLE, SELECTED_STYLE = BASE, SELECTED
@@ -340,6 +343,7 @@ class Conversation:
         self.topic_start = 0
         self.investigation = None
         self.browse_directory: str | None = None
+        self.filesystem_panels = {}
         self.changed = lambda: None
 
     def submit(self, prompt):
@@ -483,6 +487,8 @@ COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>')
              ('/panels', 'Choose a workspace from the Panels menu'),
              ('/watch', 'Configure port, process, disk and log watches'),
              ('/services', 'Browse services and prepare start/stop commands'),
+             ('/changes', 'Machine baseline: files, processes, listening ports and services'),
+             ('/storage', 'Explore folder sizes, visual usage bars and largest files'),
              ('/investigate', 'Guided TCP diagnosis: host:port | next | conclude | off'),
              ('/inspect', 'Show active inspector context; /inspect off detaches it'),
              ('/git', 'Open Git workspace for the current folder: /git [status]'),
@@ -1349,6 +1355,14 @@ def handle_submission(text):
                 git_panel = WatchesPanel(conversation.cwd, watch_engine)
             elif verb == '/services':
                 git_panel = ServicesPanel(conversation.cwd)
+            elif verb in ('/changes', '/storage'):
+                if argument:
+                    raise ValueError(f'Use {verb} without arguments; choose a folder inside the panel.')
+                key = (verb, conversation.cwd)
+                if key not in conversation.filesystem_panels:
+                    panel_type = ChangesPanel if verb == '/changes' else StoragePanel
+                    conversation.filesystem_panels[key] = panel_type(conversation.cwd)
+                git_panel = conversation.filesystem_panels[key]
             elif verb == '/investigate':
                 investigate_command(argument)
             elif verb == '/network':
@@ -3132,6 +3146,8 @@ def draw_pry_header(cols, controls=False):
     workspace = ('Scratchpad' if isinstance(git_panel, ScratchpadPanel) else
                  'Watches' if isinstance(git_panel, WatchesPanel) else
                  'Services' if isinstance(git_panel, ServicesPanel) else
+                 'Changes' if isinstance(git_panel, ChangesPanel) else
+                 'Storage' if isinstance(git_panel, StoragePanel) else
                  'Network' if isinstance(git_panel, NetworkPanel) else
                  'Git' if git_panel else 'Files' if browser else 'Models' if model_picker else 'Chat')
     label = f' Pry / {workspace}'
@@ -3215,10 +3231,11 @@ def draw_panels_menu():
     first = max(0, selected - capacity + 1)
     visible = matches[first:first+capacity]
     for index, label, command in visible:
-        entries.append((f' {index+1}  {label:<12} {command}', SELECTED_STYLE if index == panels_menu else PANEL + WHITE))
+        shortcut = str(index + 1) if index < 9 else '-'
+        entries.append((f' {shortcut}  {label:<12} {command}', SELECTED_STYLE if index == panels_menu else PANEL + WHITE))
     if not matches:
         entries.append((' No matching workspaces', GREY))
-    entries.append((f' Enter open | Esc close | 1-{len(PANEL_ITEMS)} jump', GREY))
+    entries.append((f' Enter open | Esc close | 1-{min(9, len(PANEL_ITEMS))} jump', GREY))
     for offset, (text, style) in enumerate(entries[:height]):
         sys.stdout.write(f'\033[{top+offset};{left}H' + wrap_terminal_line(BASE_STYLE + PANEL + style + text.ljust(width), width)[0])
         if 2 <= offset < 2 + len(visible):
