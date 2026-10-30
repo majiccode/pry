@@ -2,8 +2,10 @@
 import queue
 import re
 import threading
+import unicodedata
 from typing import Any
 from git_workspace import Repository
+from tui_theme import PANEL, BORDER, SUCCESS, WARNING, ERROR, BUTTON, FOCUSED_BUTTON
 
 
 def visible(text):
@@ -11,10 +13,25 @@ def visible(text):
     return ''.join(c if c == '\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in str(text))
 
 
+def field_tail(value, width):
+    """Keep the editing end visible, including paths with wide characters."""
+    value = visible(value).expandtabs(4)
+    sizes = [0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+             for c in value]
+    if sum(sizes) <= width:
+        return value
+    used, start = 0, len(value)
+    for index in range(len(value) - 1, -1, -1):
+        if used + sizes[index] > max(0, width - 1):
+            break
+        used, start = used + sizes[index], index
+    return '<' + value[start:]
+
+
 def diff_rows(patch, width, wrap, styles):
     """Render unified patches without altering the underlying operation output."""
     base, muted, text, accent, _ = styles
-    added, removed = '\033[38;5;114m', '\033[38;5;203m'
+    added, removed = SUCCESS, ERROR
     lines = patch.splitlines()
     if not any(line.startswith('diff --git ') for line in lines):
         return [row for line in lines for row in wrap(base + text + visible(line), width)]
@@ -253,7 +270,12 @@ class GitPanel:
                 self.form = None
             elif event == 'pane' or event == 'key' and value == '\t':
                 if fields:
-                    form['index'] = (form['index'] + 1) % len(fields)
+                    form['index'] = (form['index'] + (-1 if event == 'pane' else 1)) % len(fields)
+            elif event == 'click' and any(a == 'field' and y == value[1] and l <= value[0] <= r for y,l,r,a,_ in self.zones):
+                form['index'] = next(argument for y,l,r,a,argument in self.zones
+                                     if a == 'field' and y == value[1] and l <= value[0] <= r)
+            elif event == 'click' and any(a == 'cancel_form' and y == value[1] and l <= value[0] <= r for y,l,r,a,_ in self.zones):
+                return self.event('escape', None)
             elif event == 'key' and value == '\r' or event == 'click' and any(a == 'submit' and y == value[1] and l <= value[0] <= r for y,l,r,a,_ in self.zones):
                 if fields and any(not text.strip() for _, text in fields):
                     self.message = 'Fill in each field. Tab moves between fields.'
@@ -270,8 +292,8 @@ class GitPanel:
         if event == 'escape':
             return self.activate('close')
         if event == 'pane' or event == 'key' and value == '\t':
-            focus = ['list', 'actions', 'output']
-            self.focus = focus[(focus.index(self.focus) + (-1 if event == 'pane' else 1)) % 3]
+            focus = ['list', 'actions'] + (['output'] if getattr(self, 'output_visible', True) else [])
+            self.focus = focus[(focus.index(self.focus) + (-1 if event == 'pane' else 1)) % len(focus)]
         elif event == 'click':
             x, y = value
             for row, left, right, action, argument in self.zones:
@@ -282,7 +304,13 @@ class GitPanel:
                     elif action == 'entry':
                         self.index, self.focus = argument, 'list'
                         return self.activate(self.entry_action())
+                    elif action == 'action_step':
+                        self.focus = 'actions'
+                        self.action_index = (self.action_index + argument) % len(self.actions())
+                    elif action == 'output_focus':
+                        self.focus = 'output'
                     else:
+                        self.action_index = next((i for i, (_, name) in enumerate(self.actions()) if name == action), self.action_index)
                         return self.activate(action)
                     break
         elif event in ('scroll', 'wheel', 'page', 'home', 'end', 'cursor'):
@@ -301,7 +329,7 @@ class GitPanel:
                 maximum = len(self.entries()) - 1
                 self.index = max(0, min(maximum, 0 if event == 'home' else maximum if event == 'end' else self.index + amount))
         elif event == 'key':
-            if value in '1234':
+            if value in ('1', '2', '3', '4') and int(value) <= len(self.tabs):
                 self.tab = self.tabs[int(value) - 1][0]
                 self.index = self.top = 0
             elif value == '\r':
@@ -315,53 +343,86 @@ class GitPanel:
         rows = max(0, rows - top)
         base, muted, text, accent, selected = styles
         self.zones = []
-        output = [base + '\033[H\033[2J']
+        if cols <= 0 or rows <= 0:
+            return ''
+        output = [base + (f'\033[{row + top};1H' + ' ' * cols) for row in range(1, rows + 1)]
 
         def put(row, col, value, width, style=muted):
             if 1 <= row <= rows and 1 <= col <= cols and width > 0:
-                output.append(f'\033[{row + top};{col}H' + wrap(base + style + visible(value), min(width, cols-col+1))[0])
+                width = min(width, cols-col+1)
+                output.append(f'\033[{row + top};{col}H' + base + style + ' ' * width)
+                output.append(f'\033[{row + top};{col}H' + wrap(base + style + visible(value), width)[0])
+
+        def strip(items, current, row, kind):
+            # Keep the selected item in a one-line window, even on small terminals.
+            room = max(1, cols - 4) if cols >= 5 else cols
+            start = min(getattr(self, '_' + kind + '_start', 0), current)
+            while start < current and sum(len(label) + 1 for label, _ in items[start:current+1]) - 1 > room:
+                start += 1
+            setattr(self, '_' + kind + '_start', start)
+            col = 3 if cols >= 5 else 1
+            end = col + room
+            stop = start
+            for index in range(start, len(items)):
+                label, argument = items[index]
+                width = min(len(label), end - col)
+                if width <= 0 or index != start and len(label) > width:
+                    break
+                style = PANEL + accent if kind == 'tab' else BUTTON
+                if index == current:
+                    style = selected if kind == 'tab' else FOCUSED_BUTTON if self.focus == 'actions' else BUTTON + accent
+                put(row, col, label, width, style)
+                self.zones.append((row, col, col+width-1, 'tab' if kind == 'tab' else argument, argument if kind == 'tab' else None))
+                col += width + 1
+                stop = index + 1
+            if cols >= 5:
+                if start:
+                    put(row, 1, '<', 1, accent)
+                    self.zones.append((row, 1, 1, 'tab' if kind == 'tab' else 'action_step',
+                                       items[start-1][1] if kind == 'tab' else start-1-current))
+                if stop < len(items):
+                    put(row, cols, '>', 1, accent)
+                    self.zones.append((row, cols, cols, 'tab' if kind == 'tab' else 'action_step',
+                                       items[stop][1] if kind == 'tab' else stop-current))
 
         heading, title = self.heading()
-        put(1, 1, heading, cols, text)
+        put(1, 1, heading, cols, PANEL + text)
         put(2, 1, title, cols, accent)
-        col = 1
-        for number, (tab, label) in enumerate(self.tabs, 1):
-            label = f' {number} {label} '
-            if col + len(label) - 1 <= cols:
-                put(3, col, label, len(label), selected if tab == self.tab else accent)
-                self.zones.append((3, col, col+len(label)-1, 'tab', tab))
-                col += len(label) + 1
+        tab_index = next((i for i, (tab, _) in enumerate(self.tabs) if tab == self.tab), 0)
+        strip([(f' {number} {label} ', tab) for number, (tab, label) in enumerate(self.tabs, 1)], tab_index, 3, 'tab')
+        actions = self.actions()
+        self.action_index = max(0, min(self.action_index, len(actions)-1))
+        strip([('[' + label + ']', action) for label, action in actions], self.action_index, 4, 'action')
         output_visible = getattr(self, 'output_visible', True)
         wide = cols >= 85 and not getattr(self, 'stacked_output', False) and output_visible
         left_width = min(40, cols // 3) if wide else cols
-        action_rows = []
-        col, row = 1, 4
-        for index, (label, action) in enumerate(self.actions()):
-            label = '[' + label + ']'
-            if col + len(label) - 1 > cols and col > 1:
-                row, col = row+1, 1
-            action_rows.append((row, col, label, action, index))
-            col += len(label) + 1
-        start = row + 2
-        available = max(0, rows - start - 3)
-        list_height = available if wide or not output_visible else min(6, available // 2)
-        for row, col, label, action, index in action_rows:
-            if row < rows - 3:
-                put(row, col, label, len(label), selected if self.focus == 'actions' and index == self.action_index else accent)
-                self.zones.append((row,col,min(cols,col+len(label)-1),action,None))
-        put(start-1, 1, self.list_title + (' · focused' if self.focus == 'list' else ''), left_width, accent)
+        start = 6
+        available = max(0, rows - start - 2)
+        list_height = available if wide or not output_visible else min(6, max(0, (available - 2) // 2))
+        entries = self.entries()
+        self.index = max(0, min(self.index, len(entries)-1))
+        list_heading = ('> ' if self.focus == 'list' else '  ') + self.list_title + f' ({len(entries)}) '
+        put(start-1, 1, list_heading.ljust(left_width, '-'), left_width, PANEL + accent)
         self.top = max(0, min(self.top, self.index))
         if self.index >= self.top + max(1, list_height):
             self.top = self.index - max(1, list_height) + 1
-        for n, entry in enumerate(self.entries()[self.top:self.top+list_height]):
+        for n, entry in enumerate(entries[self.top:self.top+list_height]):
             index = self.top+n
             put(start+n,1, ('› ' if index == self.index else '  ') + entry['label'], left_width-1, selected if index == self.index else text)
-            self.zones.append((start+n,1,left_width,'entry',index))
-        if not self.entries():
-            put(start,1,'No entries.',left_width)
+            if start+n <= rows-3:
+                self.zones.append((start+n,1,left_width,'entry',index))
+        if not entries and list_height:
+            label = dict(self.tabs).get(self.tab, 'this view')
+            put(start,1,'No entries in ' + label + '.',left_width)
+            if list_height > 1:
+                put(start+1,1,'Loading...' if self.busy else 'Choose an action above to get started.',left_width)
         out_col, out_row = (left_width+2,start) if wide else (1,start+list_height+1)
+        if wide:
+            for row in range(start-1, rows-2):
+                put(row,left_width+1,'|',1,BORDER)
         if output_visible:
-            put(out_row-1,out_col,self.output_title + (' · focused' if self.focus == 'output' else ''),cols-out_col+1,accent)
+            output_heading = ('> ' if self.focus == 'output' else '  ') + self.output_title + ' '
+            put(out_row-1,out_col,output_heading.ljust(cols-out_col+1, '-'),cols-out_col+1,PANEL + accent)
         output_height = max(0, rows-out_row-2) if output_visible else 0
         # Wrap before scrolling so very long lines remain accessible.
         physical = []
@@ -372,26 +433,51 @@ class GitPanel:
                 physical.extend(wrap(text + visible(line), max(1,cols-out_col+1)))
         self.output_rows = len(physical)
         self.offset = min(self.offset,max(0,len(physical)-output_height))
+        if output_visible:
+            for row in range(out_row-1, out_row+output_height):
+                self.zones.append((row,out_col,cols,'output_focus',None))
         for n,line in enumerate(physical[self.offset:self.offset+output_height]):
             if out_row+n < rows-2:
                 output.append(f'\033[{out_row+n+top};{out_col}H'+base+line)
-        hint = self.hints.get(self.actions()[self.action_index][1], '') if self.focus == 'actions' else ''
-        put(rows-2,1,self.message,cols,accent)
-        put(rows-1,1,hint or '1–4 views · Tab focus · arrows select · Enter inspect/action · wheel scroll output',cols)
+        hint = self.hints.get(actions[self.action_index][1], '') if self.focus == 'actions' else ''
+        context = (f'Action {self.action_index+1}/{len(actions)}: {actions[self.action_index][0]} | Left/Right choose | Enter apply' if self.focus == 'actions' else
+                   f'Output {min(self.offset+1, len(physical))}-{min(len(physical), self.offset+output_height)}/{len(physical)} | wheel / PgUp / PgDn scroll' if self.focus == 'output' else
+                   f'{dict(self.tabs).get(self.tab, self.tab)} | {self.index+1 if entries else 0}/{len(entries)} selected | Enter inspect | Tab actions')
+        status_style = ERROR if self.message.startswith(('Failed', 'Cannot')) else WARNING if self.busy else SUCCESS if self.message.startswith(('Finished', 'Applied')) else accent
+        self.zones = [zone for zone in self.zones if zone[0] <= rows-3]
+        put(rows-2,1,self.message,cols,status_style)
+        put(rows-1,1,hint or context,cols)
         put(rows,1,self.footer,cols)
         if self.form:
             form = self.form
-            first = max(4, rows-len(form['fields'])-5)
+            first = max(1, min(5, rows-len(form['fields'])-5))
             for row in range(first, rows+1):
-                output.append(f'\033[{row+top};1H'+base+' '*cols)
-            put(first,1,form['summary'],cols,text)
-            for n,(name,value) in enumerate(form['fields']):
-                put(first+n+1,1,('› ' if n == form['index'] else '  ')+name+': '+value,cols,selected if n == form['index'] else text)
-            row = min(rows-1,first+len(form['fields'])+2)
-            put(row,1,'[Apply]',7,accent)
-            self.zones = [(row,1,7,'submit',None)]
-            put(rows,1,'Enter applies · Tab next field · Esc cancels',cols)
+                output.append(f'\033[{row+top};1H'+base+PANEL+' '*cols)
+            self.zones = []
+            put(first,1,form['summary'],cols,PANEL + text)
+            capacity = max(0, rows-first-4)
+            field_start = max(0, form['index']-capacity+1)
+            for n,(name,value) in enumerate(form['fields'][field_start:field_start+capacity]):
+                index = field_start+n
+                label = ('> ' if index == form['index'] else '  ') + name + ': '
+                # Show the editing end of long values rather than hiding new input.
+                value_width = max(1, cols-min(len(label), cols//2)-1)
+                if index == form['index']:
+                    value = field_tail(value, value_width)
+                if len(label) > cols//2:
+                    label = label[:max(0,cols//2-2)] + ': '
+                row = first+n+1
+                put(row,1,label+value,cols,selected if index == form['index'] else PANEL + text)
+                self.zones.append((row,1,cols,'field',index))
+            put(rows-2,1,self.message,cols,PANEL + status_style)
+            put(rows-1,1,'[Apply]',7,FOCUSED_BUTTON)
+            self.zones.append((rows-1,1,min(cols,7),'submit',None))
+            if cols >= 18:
+                put(rows-1,10,'[Cancel]',8,BUTTON)
+                self.zones.append((rows-1,10,17,'cancel_form',None))
+            put(rows,1,'Enter applies | Tab / Shift+Tab fields | Esc cancels',cols,PANEL + muted)
         self.zones = [(row + top, left, right, action, argument)
-                      for row, left, right, action, argument in self.zones]
+                      for row, left, right, action, argument in self.zones
+                      if 1 <= row <= rows and 1 <= left <= right <= cols]
         output.append('\033[?25l')
         return ''.join(output)

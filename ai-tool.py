@@ -39,6 +39,8 @@ from watches_panel import WatchesPanel
 from response_rendering import render_markdown
 from file_preview import render_file_preview
 import investigation
+from tui_theme import (BACKGROUND, BASE, TEXT, MUTED, ACCENT, SECONDARY, BORDER,
+                       PANEL, SUCCESS, WARNING, ERROR, SELECTED, BUTTON, FOCUSED_BUTTON)
 
 MODEL_NAME = "linux-cmds-7b"
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -58,20 +60,15 @@ sidebar_visible = True
 git_panel = None
 watch_engine = None
 panels_menu = None
+panels_query = ''
 session_delete_pending = None
 PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
                ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
                ('Models', '/models'), ('Sessions', '/bookmarks')]
-BLACK_BG = '\033[49m'
-ORANGE = '\033[38;5;109m'
-CYAN = '\033[38;5;109m'
-GREY = '\033[38;5;245m'
-WHITE = '\033[38;5;252m'
-LIGHT_ORANGE = '\033[38;5;250m'
-BASE_STYLE = '\033[0m' + BLACK_BG + GREY
-SELECTED_STYLE = '\033[1;38;5;252;48;5;238m'
-BUTTON_STYLE = '\033[49;38;5;109m'
-FOCUSED_BUTTON_STYLE = '\033[1;4;38;5;252;48;5;238m'
+BLACK_BG, ORANGE, CYAN = BACKGROUND, ACCENT, SECONDARY
+GREY, WHITE, LIGHT_ORANGE = MUTED, TEXT, WARNING
+BASE_STYLE, SELECTED_STYLE = BASE, SELECTED
+BUTTON_STYLE, FOCUSED_BUTTON_STYLE = BUTTON, FOCUSED_BUTTON
 
 
 def settings_path():
@@ -996,17 +993,19 @@ def draw_model_picker(cols, rows):
     def put(row, text, color=GREY):
         if 1 <= row <= rows:
             sys.stdout.write(f'\033[{row+1};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
-    put(1, 'Ollama models — select a chat model', ORANGE)
-    put(2, f'Current: {MODEL_NAME}')
+    put(1, ' Models / choose your local AI', PANEL + WHITE)
+    put(2, f' {len(model_picker["models"])} installed | Current: {MODEL_NAME}')
     height = max(0, rows - 5)
     model_picker['top'] = min(model_picker['top'], model_picker['index'])
     if height and model_picker['index'] >= model_picker['top'] + height:
         model_picker['top'] = model_picker['index'] - height + 1
     for offset, name in enumerate(model_picker['models'][model_picker['top']:model_picker['top'] + height]):
         index = model_picker['top'] + offset
-        put(offset + 3, f'{">" if index == model_picker["index"] else " "} {name}' + ('  (current)' if name == MODEL_NAME else ''),
-            SELECTED_STYLE if index == model_picker['index'] else ORANGE)
+        put(offset + 3, (f'{">" if index == model_picker["index"] else " "} {name}' + ('  (current)' if name == MODEL_NAME else '')).ljust(cols),
+             SELECTED_STYLE if index == model_picker['index'] else ORANGE)
         click_zones[(offset + 4, 1, cols)] = ('picker_model', index)
+    if not model_picker['models'] and height:
+        put(3, ' Loading models...' if model_picker['loading'] else ' No models found. Use ollama pull <model> to install one.')
     put(rows - 2, model_picker['message'])
     put(rows - 1, BUTTON_STYLE + ' Refresh (r) ' + BASE_STYLE)
     put(rows, BUTTON_STYLE + ' Close (Esc) ' + BASE_STYLE + '  Up/Down: move | Enter/click: select')
@@ -1189,7 +1188,8 @@ def handle_submission(text):
             elif verb == '/keys':
                 add_local_result(conversation, text, 'Ctrl+P/N: previous/next input | Ctrl+R: retry | Ctrl+C: stop active work, otherwise exit\n'
                                  'Tab/Shift+Tab: inspector focus | Alt+Enter: newline | PageUp/Down: scroll\n'
-                                 'Ctrl+B or /sidebar: toggle sessions | Command cards: Edit, Run, More (extra actions).\n'
+                                 'Ctrl+K: searchable workspaces | Ctrl+B or /sidebar: toggle sessions\n'
+                                 'Command cards: Edit, Run, More (extra actions). Tab completes slash commands.\n'
                                  'Use {{name}} as an unquoted whole-word recipe parameter.\n'
                                  '/recipe shows workflow syntax. /search filters saved sessions. /doctor checks setup.')
         except (OSError, ValueError, TypeError) as exc:
@@ -1201,7 +1201,8 @@ def handle_submission(text):
         new_session()
         status_message = 'New autosaved conversation started.'
     elif command == '/help':
-        status_message = 'Commands: ' + ' '.join(cmd for cmd, _ in COMMANDS) + ' | Type / to see descriptions'
+        add_local_result(conversation, '/help', '\n'.join(f'{cmd:<16} {description}' for cmd, description in COMMANDS))
+        status_message = 'Command reference added below. Type / to browse, or Ctrl+K for workspaces.'
     elif command == '/bookmarks':
         active_pane = 'bookmarks'
         status_message = 'Click a saved conversation to open it. Shift+Tab switches panes.'
@@ -1976,6 +1977,9 @@ def inline_action(item, action, argument=None):
     global status_message, follow_output, current_input_buffer, input_cursor, inline_focus, git_panel
     view = item.setdefault('_inline', dict(stack=[], page=item['interactive'], offset=0, collapsed=False))
     page = view['page']
+    if action == 'more':
+        view['more'] = not view.get('more', False)
+        return
     if action == 'watch':
         if watch_engine is None:
             status_message = 'Watches unavailable; check the work directory and restart.'
@@ -2179,7 +2183,7 @@ def cycle_inline_focus(direction):
 def handle_inline_event(event, value):
     """Consume inspector navigation, leaving ordinary typing to the chat editor."""
     global inline_focus, inline_control, follow_output, scroll_top_index
-    if event == 'pane' or event == 'key' and value == '\t':
+    if inline_tab_stops and (event == 'pane' or event == 'key' and value == '\t'):
         cycle_inline_focus(-1 if event == 'pane' else 1)
         return True
     if event == 'scroll' and value < 0 and inline_focus is None and inline_tab_stops:
@@ -2369,23 +2373,26 @@ def build_transcript(history, width, saved=False):
             row = button(label, 'inline', (index, action, argument),
                          item.get('token') == inline_focus and action == inline_control)
             inline_tab_stops.append((item.get('token'), action, row))
-        control('Expand inspector' if view['collapsed'] else 'Collapse inspector', 'collapse')
-        control('Hide original output' if view.get('original') else 'Show original output', 'original')
+        control('Expand' if view['collapsed'] else 'Collapse', 'collapse')
         if view['collapsed']:
             return
         page = view['page']
-        control(('Focused inspector: ' if item.get('token') == inline_focus else 'Inspector: ') + page.get('title', ''), 'focus')
+        add('Inspector / ' + page.get('title', ''), CYAN)
+        control('Select rows', 'focus')
         if conversation is not None and getattr(conversation, 'inspector_token', None) == item.get('token'):
             add('Attached to AI prompt', CYAN)
         control('Ask AI about this', 'ask_ai')
-        control('Watch This', 'watch')
         if view['stack']:
             control('Back', 'back')
         control('Refresh', 'refresh')
         control('Filter' + (': ' + view['filter'] if view.get('filter') else ''), 'filter')
-        control('Copy', 'copy')
-        control('Explain', 'explain')
-        control('Add observations to context', 'context')
+        control('Less' if view.get('more') else 'More...', 'more')
+        if view.get('more'):
+            control('Hide original' if view.get('original') else 'Original output', 'original')
+            control('Watch This', 'watch')
+            control('Copy', 'copy')
+            control('Explain', 'explain')
+            control('Add observations to context', 'context')
         if page.get('log') and item.get('pending'):
             control('Resume live' if view.get('paused') else 'Pause live', 'pause')
         if page.get('sortable'):
@@ -2431,7 +2438,7 @@ def build_transcript(history, width, saved=False):
                 continue
             label = ' '.join(entry['label'].split())
             content.extend((physical, entry['target']) for physical in wrap_terminal_line(label, max(1, width - 2)))
-        height = max(15, len(content))
+        height = max(1, len(content))
         view.update(content=content, height=height, content_row=len(lines))
         view['cursor'] = max(0, min(view.get('cursor', 0), len(content) - 1))
         first = view['offset'] = 0
@@ -2450,8 +2457,8 @@ def build_transcript(history, width, saved=False):
                 add(prefix + label, SELECTED_STYLE if selected else CYAN if target else GREY)
             for physical in range(row, len(lines)):
                 zones.setdefault(physical, []).append((1, width, 'inline', (index, 'row', position)))
-        for _ in range(max(0, 15 - len(content))):
-            add('')
+        if not content:
+            add('No matching entries.' if view.get('filter') else 'No entries to display.')
         add(f'{len(content)} rows | wheel: scroll chat | arrows: select')
         if item.get('token') == inline_focus:
             add('Enter: inspect | Space/Right: folder | Left: back | r: refresh | a: context | Esc: chat')
@@ -2475,14 +2482,27 @@ def build_transcript(history, width, saved=False):
         if conversation.context_notice:
             add(conversation.context_notice)
     if not history:
-        add('Ask about macOS/Linux terminal commands. Type /help for commands.')
+        add('')
+        add('Pry / your local terminal workspace', ORANGE)
+        add('')
+        add('Ask a question. Inspect the result. Keep moving.', WHITE)
+        add('Get help with commands, explore your machine, or work through a problem.')
+        add('')
+        button('Browse files', 'files', 0)
+        button('Open workspaces', 'panels', 0)
+        add('')
+        add('/cmd <command>  Capture output for inspection', CYAN)
+        add('/git            Review changes and branches', CYAN)
+        add('/               Explore commands as you type', CYAN)
+        add('')
+        add('Local AI via Ollama. Model replies never run commands automatically.')
     for index, item in enumerate(history):
         boundary = selected_bookmark.get('topic_start', 0) if saved and selected_bookmark else conversation.topic_start if conversation else 0
         if index == boundary and boundary:
             add('── Fresh topic ──', CYAN)
         is_command = item.get('kind') == 'command'
         local = item.get('local')
-        label = 'TERMINAL' if is_command else 'LOCAL · ' + item['prompt'].split()[0] if local else 'YOU'
+        label = 'Terminal' if is_command else 'Reference / ' + item['prompt'].split()[0] if local else 'You'
         add(label, CYAN)
         add(('$ ' if is_command else '') + item['prompt'], WHITE)
         if item.get('pending'):
@@ -2498,13 +2518,13 @@ def build_transcript(history, width, saved=False):
             else:
                 add('Loading reference…' if local else 'Running / queued…' if is_command else 'Thinking / queued…')
         else:
-            label = 'OUTPUT' if is_command else 'REFERENCE' if local else 'ASSISTANT'
+            label = 'Output' if is_command else 'Reference' if local else 'Pry'
             detail = ''
             if is_command and 'exit_code' in item:
                 detail = f' · exit {item["exit_code"]}'
                 if isinstance(item.get('duration'), (int, float)):
                     detail += f' · {item["duration"]:.1f}s'
-            add(label + detail + (' · failed' if item.get('error') else ''), CYAN)
+            add(label + detail + (' · failed' if item.get('error') else ''), ERROR if item.get('error') else ORANGE)
             if item.get('interactive'):
                 inline(item, index)
             if not item.get('interactive') or item.get('_inline', {}).get('original'):
@@ -2531,8 +2551,6 @@ def build_transcript(history, width, saved=False):
             if item.get('execution_output'):
                 add(f"Execution Output:\n{item['execution_output']}", LIGHT_ORANGE)
         add('')
-        add('─' * min(60, width))
-        add('')
     if model_build_output and not saved:
         add(model_build_output, LIGHT_ORANGE)
     return lines, zones
@@ -2547,8 +2565,8 @@ def draw_file_browser(cols, rows):
     def put(row, text, color=GREY):
         if 1 <= row <= rows:
             sys.stdout.write(f'\033[{row+1};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
-    put(1, f'Files: {browser["directory"]}', ORANGE)
-    put(2, f'Selected: {len(browser["selected"])} paths | Binaries greyed out; text only')
+    put(1, f' Files / {browser["directory"]}', PANEL + WHITE)
+    put(2, f' {len(browser["selected"])} selected | Space selects | Enter opens | Text files only')
     height = max(0, rows - 6)
     browser['top'] = max(0, min(browser['top'], browser['index']))
     if height and browser['index'] >= browser['top'] + height:
@@ -2568,8 +2586,10 @@ def draw_file_browser(cols, rows):
         label = f'{marker} [{selected}] {path.name}{"/" if path.is_dir() else ""}'
         if reason:
             label += f' (unavailable: {reason})'
-        put(offset + 3, label, GREY if reason else CYAN)
+        put(offset + 3, label.ljust(cols), SELECTED_STYLE if index == browser['index'] else GREY if reason else WHITE)
         click_zones[(offset + 4, 1, cols)] = ('browser_entry', index)
+    if not browser['entries'] and height:
+        put(3, ' This directory is empty. Backspace goes to its parent.')
     put(rows - 3, BUTTON_STYLE + ' Add Selected (a)  Watch This (w) ' + BASE_STYLE)
     put(rows - 2, BUTTON_STYLE + ' Use Directory (u) ' + BASE_STYLE)
     if rows >= 6:
@@ -2617,8 +2637,7 @@ def hover_region(position):
         right = min(right - 1, left + width - 1)
         return (row, left, right) if left <= x <= right else None
     if action[0] == 'panel_choice':
-        right = min(right, left + len(PANEL_ITEMS[action[1]][0]) + 1)
-        return (row, left, right) if left <= x <= right else None
+        return row, left, right
     if git_panel is None and action[0] == 'inline':
         _, operation, argument = action[1]
         if operation == 'focus':
@@ -2677,18 +2696,16 @@ def hover_overlay(frame):
 
 
 def draw_pry_header(cols, controls=False):
-    color = '\033[38;5;208m'
-
-    def put(col, text, width):
-        sys.stdout.write(f'\033[1;{col}H' + wrap_terminal_line(BASE_STYLE + color + text, width)[0])
+    def put(col, text, width, color=WHITE):
+        sys.stdout.write(f'\033[1;{col}H' + wrap_terminal_line(BASE_STYLE + PANEL + color + text, width)[0])
 
     put(1, ' ' * cols, cols)
-    actions = [('Panels', 'panels')] if cols >= 16 else []
+    actions = [('Panels ^K', 'panels')] if cols >= 20 else []
     right = cols + 1
     for label, action in reversed(actions):
         text = f' {label} '
         start = right - len(text)
-        put(start, text, len(text))
+        put(start, text, len(text), ORANGE)
         click_zones[(1, start, right - 1)] = (action, 0)
         right = start - 1
     directory = conversation.cwd if conversation else str(Path.cwd())
@@ -2704,8 +2721,33 @@ def draw_pry_header(cols, controls=False):
         running = sum(item['status'] == 'running' for item in watch_engine.items)
         triggered = sum(bool(item['events']) for item in watch_engine.items)
         if running or triggered:
-            watching = f' | Watches: {running} / Alerts: {triggered}'
-    put(1, f'Pry{watching} | {MODEL_NAME} | {activity} | {directory}', max(1, right - 1))
+            watching = f' | {running} watches / {triggered} alerts'
+    workspace = ('Watches' if isinstance(git_panel, WatchesPanel) else
+                 'Services' if isinstance(git_panel, ServicesPanel) else
+                 'Network' if isinstance(git_panel, NetworkPanel) else
+                 'Git' if git_panel else 'Files' if browser else 'Models' if model_picker else 'Chat')
+    label = f' Pry / {workspace}'
+    available = max(1, right - 1)
+    for detail in (f' | {activity}', f' | {MODEL_NAME}', watching):
+        if len(label + detail) <= available:
+            label += detail
+    remaining = available - len(label) - 3
+    if remaining >= 8:
+        path_cells = list(text_cells(directory))
+        if path_cells and path_cells[-1][2] > remaining:
+            tail, used = '', 0
+            for unit, first, last in reversed(path_cells):
+                if used + last - first + 1 > remaining - 3:
+                    break
+                tail, used = unit + tail, used + last - first + 1
+            directory = '...' + tail
+        label += ' | ' + directory
+    put(1, label, available, ORANGE)
+
+
+def panel_matches():
+    return [(index, label, command) for index, (label, command) in enumerate(PANEL_ITEMS)
+            if panels_query.casefold() in (label + ' ' + command).casefold()]
 
 
 def draw_panels_menu():
@@ -2713,13 +2755,28 @@ def draw_panels_menu():
         cols, rows = os.get_terminal_size()
     except OSError:
         cols, rows = 80, 24
-    width = min(22, cols)
-    left = max(1, cols - width + 1)
-    for index, (label, _) in enumerate(PANEL_ITEMS[:max(0, rows - 1)]):
-        style = SELECTED_STYLE if index == panels_menu else BASE_STYLE + WHITE
-        text = f' {label} '.ljust(width)
-        sys.stdout.write(f'\033[{index+2};{left}H' + wrap_terminal_line(style + text, width)[0])
-        click_zones[(index+2, left, cols)] = ('panel_choice', index)
+    width = min(56, cols)
+    left = max(1, (cols - width) // 2 + 1)
+    matches = panel_matches()
+    height = min(rows, max(5, len(matches) + 4))
+    top = max(1, min(4, rows - height + 1))
+    for offset in range(height):
+        sys.stdout.write(f'\033[{top+offset};{left}H' + BASE_STYLE + PANEL + ' ' * width)
+    entries = [(' Workspaces', ORANGE), (' > ' + (panels_query or 'Type to filter...'), WHITE)]
+    capacity = max(0, height - 3)
+    selected = next((position for position, item in enumerate(matches) if item[0] == panels_menu), 0)
+    first = max(0, selected - capacity + 1)
+    visible = matches[first:first+capacity]
+    for index, label, command in visible:
+        entries.append((f' {index+1}  {label:<12} {command}', SELECTED_STYLE if index == panels_menu else PANEL + WHITE))
+    if not matches:
+        entries.append((' No matching workspaces', GREY))
+    entries.append((' Enter open | Esc close | 1-8 jump', GREY))
+    for offset, (text, style) in enumerate(entries[:height]):
+        sys.stdout.write(f'\033[{top+offset};{left}H' + wrap_terminal_line(BASE_STYLE + PANEL + style + text.ljust(width), width)[0])
+        if 2 <= offset < 2 + len(visible):
+            click_zones[(top+offset, left, left+width-1)] = ('panel_choice', visible[offset-2][0])
+    sys.stdout.write('\033[?25l')
 
 
 def choose_panel(index):
@@ -2770,7 +2827,7 @@ def render_screen():
     menu_height = min(len(matches), max(0, rows - input_height - 4 - attachment_height))
     height = max(0, rows - input_height - 4 - menu_height - attachment_height)
     viewport_rows = max(1, height)
-    sidebar_width = min(32, max(22, cols // 4)) if cols >= 60 and sidebar_visible else 0
+    sidebar_width = min(34, max(26, cols // 4)) if cols >= 100 and sidebar_visible else 0
     sidebar_start = cols - sidebar_width + 1 if sidebar_width else None
     # On small terminals Shift+Tab or /bookmarks opens the full-width list.
     list_only = not sidebar_width and active_pane == 'bookmarks'
@@ -2809,9 +2866,9 @@ def render_screen():
             inspector_page = source.get('_inline', {}).get('page', source.get('interactive', {})) if source else {}
             title = ('AI context: ' + inspector_page.get('title', 'inspector') + ' · /inspect off'
                      if inspector_page else 'Following: ' + conversational_focus(conversation))
-        put(2, 1, f'{">" if active_pane == "chat" else " "} {title}', chat_width)
+        put(2, 1, f'{">" if active_pane == "chat" else " "} {title}'.ljust(chat_width), chat_width, PANEL + GREY)
         if sidebar_width or list_only:
-            put(2, sidebar_start or 1, f'{">" if active_pane == "bookmarks" else " "} Bookmarks ({len(saved_items)})', sidebar_width or cols)
+            put(2, sidebar_start or 1, f'{">" if active_pane == "bookmarks" else " "} Sessions ({len(saved_items)})'.ljust(sidebar_width or cols), sidebar_width or cols, PANEL + WHITE)
     for offset in range(height):
         screen_row = offset + 3
         if not list_only:
@@ -2825,7 +2882,7 @@ def render_screen():
                         for col in range(left, right + 1):
                             inline_screen_regions[(screen_row, col)] = index[0]
         if sidebar_start is not None:
-            put(screen_row, sidebar_start - 1, '|', 1)
+            put(screen_row, sidebar_start - 1, '│', 1, BORDER)
         if sidebar_width or list_only:
             index = bookmark_scroll_index + offset
             start, width = sidebar_start or 1, sidebar_width or cols
@@ -2833,10 +2890,10 @@ def render_screen():
                 item = saved_items[index]
                 marker = '*' if conversation and item['id'] == conversation.session_id else ' '
                 name = ' '.join((item.get('name') or item['prompt']).split())
-                label = f"{marker}{index + 1}. {name} ({len(item['history'])} turns)"
-                delete_label = ' Confirm? ' if session_delete_pending == item['id'] else ' Delete '
+                label = f"{marker} {name}"
+                delete_label = ' Confirm? ' if session_delete_pending == item['id'] else ' x '
                 name_width = max(1, width - len(delete_label))
-                put(screen_row, start, label, name_width, SELECTED_STYLE if marker == '*' else GREY)
+                put(screen_row, start, label.ljust(name_width), name_width, SELECTED_STYLE if marker == '*' else WHITE)
                 click_zones[(screen_row, start, start + name_width - 1)] = ('open', index)
                 if width > len(delete_label):
                     put(screen_row, start + name_width, delete_label, len(delete_label), LIGHT_ORANGE)
@@ -2857,12 +2914,14 @@ def render_screen():
                 f'{marker} {command}  {description}', cols,
                 SELECTED_STYLE if index == selected else ORANGE)
     if rows >= 3:
-        hint = 'Up/Down: select | Enter: run | Esc: dismiss | Tab: focus' if matches else 'Enter send · Alt+Enter newline · Ctrl+B sessions · /keys help'
-        put(input_start - 1 - attachment_height, 1, hint, cols)
+        mode = 'RUN / terminal handoff' if current_input_buffer.startswith('/run ') else 'CMD / capture output' if current_input_buffer.startswith('/cmd ') else 'ASK / local AI'
+        hint = ' Up/Down choose | Tab complete | Enter run | Esc dismiss' if matches else f' {mode}  |  Enter send  Alt+Enter newline  ^K panels'
+        put(input_start - 1 - attachment_height, 1, hint.ljust(cols), cols, PANEL + ORANGE)
     if attachment_height:
         row = input_start - 1
         right = cols + 1
-        for label, action in reversed([('Change', 'inspector_change'), ('Clear', 'inspector_clear')]):
+        attached = conversation and getattr(conversation, 'inspector_token', None)
+        for label, action in reversed([('Change', 'inspector_change'), ('Clear', 'inspector_clear')] if attached else []):
             text = '[' + label + ']'
             start = right - len(text)
             if start < 1:
@@ -2871,11 +2930,14 @@ def render_screen():
             click_zones[(row, start, right - 1)] = (action, 0)
             right = start - 1
         if right > 1:
-            label = inspector_attachment_label(conversation) if conversation else 'Conversation only · no inspector attached'
-            put(row, 1, 'Ask AI about: ' + label, right - 1, CYAN)
+            label = inspector_attachment_label(conversation) if attached else 'Conversation' + (f' | {len(conversation.paths)} context paths' if conversation and conversation.paths else '')
+            put(row, 1, (' Context / ' + label).ljust(right - 1), right - 1, PANEL + CYAN)
     for offset, draft in enumerate(draft_lines[draft_first:draft_first + input_height]):
-        prefix = ('ai > ' if draft_first + offset == 0 else '   > ') if prefix_width else ''
-        put(input_start + offset, 1, ORANGE + prefix + WHITE + draft, cols)
+        prefix = ('  >  ' if draft_first + offset == 0 else '  |  ') if prefix_width else ''
+        put(input_start + offset, 1, ' ' * cols, cols, PANEL)
+        put(input_start + offset, 1, PANEL + ORANGE + prefix + WHITE + draft, cols)
+        if not current_input_buffer and offset == 0 and cols > prefix_width:
+            put(input_start, prefix_width + 1, 'Ask anything, or / for commands', cols - prefix_width, PANEL + GREY)
     paint_selection()
     sys.stdout.write(f'\033[{input_start + cursor_row - draft_first};{prefix_width + cursor_col + 1}H')
     sys.stdout.flush()
@@ -2884,7 +2946,7 @@ def handle_direct_action(action_type, index):
     """Open saved transcripts or act on a command in the visible transcript."""
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, inline_focus, inline_control
     global conversation, session_history, current_input_buffer, input_cursor
-    global sidebar_visible, git_panel, panels_menu, session_delete_pending
+    global sidebar_visible, git_panel, panels_menu, panels_query, session_delete_pending
     if action_type == 'session_delete':
         if bookmark_store is None:
             status_message = 'Sessions unavailable; check the work folder and restart.'
@@ -2910,6 +2972,7 @@ def handle_direct_action(action_type, index):
         return
     if action_type == 'panels':
         panels_menu = None if panels_menu is not None else 0
+        panels_query = ''
         return
     if action_type == 'panel_choice':
         choose_panel(index)
@@ -2946,6 +3009,10 @@ def handle_direct_action(action_type, index):
         handle_submission('/git')
         return
     if action_type == 'sidebar':
+        if screen_columns < 100:
+            active_pane = 'chat' if active_pane == 'bookmarks' else 'bookmarks'
+            status_message = 'Sessions. Click a session to resume; Ctrl+B returns to chat.' if active_pane == 'bookmarks' else 'Live conversation'
+            return
         try:
             save_setting('sidebar_visible', not sidebar_visible)
             sidebar_visible = not sidebar_visible
@@ -3136,7 +3203,7 @@ def cli_main():
 
 def main():
     global current_input_buffer, input_cursor, follow_output, active_pane, mouse_selection, mouse_press, inline_focus
-    global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover, panels_menu
+    global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover, panels_menu, panels_query
     
     if len(sys.argv) > 1 or not sys.stdin.isatty() or not sys.stdout.isatty():
         try:
@@ -3189,6 +3256,10 @@ def main():
                 mouse_selection, mouse_press = None, None
             if event == 'eof':
                 break
+            if event == 'key' and value == '\x0b':
+                handle_direct_action('panels', 0)
+                redraw_screen()
+                continue
             if event == 'click' and value[1] == 1:
                 hit = next((action for (row, left, right), action in click_zones.items()
                             if row == 1 and left <= value[0] <= right), None)
@@ -3197,18 +3268,26 @@ def main():
                     redraw_screen()
                     continue
             if panels_menu is not None:
+                matches = panel_matches()
+                choices = [index for index, _, _ in matches]
+                position = choices.index(panels_menu) if panels_menu in choices else 0
                 if event == 'escape' or event == 'key' and value == '\x03':
                     panels_menu = None
-                elif event == 'scroll':
-                    panels_menu = (panels_menu + value) % len(PANEL_ITEMS)
-                elif event == 'wheel':
-                    panels_menu = (panels_menu + (1 if value[0] > 0 else -1)) % len(PANEL_ITEMS)
-                elif event == 'key' and value == '\t':
-                    panels_menu = (panels_menu + 1) % len(PANEL_ITEMS)
-                elif event == 'key' and value == '\r':
+                elif choices and (event in ('scroll', 'wheel', 'pane') or event == 'key' and value == '\t'):
+                    step = value if event == 'scroll' else (1 if value[0] > 0 else -1) if event == 'wheel' else -1 if event == 'pane' else 1
+                    panels_menu = choices[(position + step) % len(choices)]
+                elif choices and event == 'key' and value == '\r':
                     choose_panel(panels_menu)
                 elif event == 'key' and value in '12345678':
                     choose_panel(int(value)-1)
+                elif event == 'key' and value in ('\x7f', '\x08'):
+                    panels_query = panels_query[:-1]
+                    filtered = panel_matches()
+                    panels_menu = filtered[0][0] if filtered else -1
+                elif event in ('key', 'paste') and isinstance(value, str) and value.isprintable():
+                    panels_query = (panels_query + value)[:80]
+                    filtered = panel_matches()
+                    panels_menu = filtered[0][0] if filtered else -1
                 elif event == 'click':
                     hit = next((action for (row, left, right), action in click_zones.items()
                                 if row == value[1] and left <= value[0] <= right and action[0] == 'panel_choice'), None)
@@ -3279,10 +3358,10 @@ def main():
                 x, y = value
                 if (y, x) not in inline_screen_regions:
                     inline_focus = None
-            if handle_inline_event(event, value):
+            if inline_focus is None and handle_completion_event(event, value):
                 redraw_screen()
                 continue
-            if handle_completion_event(event, value):
+            if handle_inline_event(event, value):
                 redraw_screen()
                 continue
             if event in ('paste', 'newline', 'cursor', 'delete', 'pane'):

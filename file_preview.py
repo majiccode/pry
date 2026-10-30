@@ -2,13 +2,9 @@
 from datetime import datetime
 from pathlib import Path
 import re
+from tui_theme import TEXT as PLAIN, MUTED, ACCENT, SUCCESS as STRING, WARNING as NUMBER
 
 
-PLAIN = '\033[38;5;252m'
-MUTED = '\033[38;5;245m'
-ACCENT = '\033[38;5;109m'
-STRING = '\033[38;5;150m'
-NUMBER = '\033[38;5;180m'
 LANGUAGES = {
     '.py': 'Python', '.js': 'JavaScript', '.jsx': 'JavaScript',
     '.ts': 'TypeScript', '.tsx': 'TypeScript', '.json': 'JSON',

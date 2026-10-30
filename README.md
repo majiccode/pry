@@ -144,17 +144,23 @@ of your filesystem or a command that runs without your action.
 
 `/help` lists commands; `/keys` shows shortcuts. Ctrl+P/N recalls input, Ctrl+R
 retries the last AI question, Ctrl+C stops active work (otherwise exits).
-Alt+Enter inserts a newline. Tab/Shift+Tab moves inspector focus.
+Alt+Enter inserts a newline. Tab completes slash commands, otherwise Tab/Shift+Tab
+moves inspector focus. **Ctrl+K** opens the searchable workspace switcher from any
+screen; type a workspace name, use arrows to select, and Enter to open it.
 
 ### Terminal-native interface
 
-The interface uses your terminal's default background, muted text, and a single
-accent color. Turn headings distinguish questions, assistant answers, terminal
-output, and local references. The header shows the model, working directory, and
-current conversational focus.
+The interface uses a consistent charcoal palette, warm accents, cool context
+labels, and highlighted selections. Turn headings distinguish questions, assistant
+answers, terminal output, and local references. A separate composer shows whether
+you are asking AI, capturing a command, or preparing a terminal handoff.
 
-The orange Pry header stays visible in chat, Git, Network, the file browser,
-and the model picker, showing the selected model, activity, and working directory.
+The Pry header stays visible across every workspace, showing the current screen,
+activity, model, and working directory as space permits. **Panels** or **Ctrl+K**
+opens a filterable workspace switcher with numbered shortcuts. Workspace tabs and
+actions use compact horizontal strips; overflow arrows reveal additional choices,
+and Left/Right moves between actions. Forms support clickable fields and reverse
+navigation with Shift+Tab. Inspectors keep secondary actions under **More...**.
 
 Assistant responses render Markdown headings, bold/italic text, inline code,
 links, lists, and quotes directly in the terminal, including while streaming.
@@ -165,13 +171,14 @@ Copy Response preserves the original Markdown; terminal output stays literal.
 
 Use **Ctrl+B** or `/sidebar` to toggle the saved
 session sidebar. The preference persists across launches, and toggling preserves
-your draft. Narrow terminals show sessions as a full-width list when focused.
+your draft. Below 100 columns, Ctrl+B shows sessions as a full-width list instead
+of squeezing the conversation into a narrow pane.
 Long terminal output and local references initially show 12 lines; **Show all**
 expands them and **Collapse output** folds them again. Copy Response always copies
 the complete captured response. When scrolled up, the status bar shows how to
 return to following new output.
 
-Each saved session has a **Delete** control. Click it, then **Confirm?** on that
+Each saved session has an **x** delete control. Click it, then **Confirm?** on that
 same row to delete the session. Opening a session cancels the confirmation.
 Deleting a session does not remove its captured command log files.
 

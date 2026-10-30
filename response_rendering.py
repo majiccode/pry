@@ -1,10 +1,9 @@
 """Small, dependency-free Markdown renderer for assistant prose."""
 import re
+from tui_theme import BASE, TEXT, ACCENT, MUTED
 
 
-RESET = '\033[0m\033[49m\033[38;5;252m'
-ACCENT = '\033[38;5;109m'
-MUTED = '\033[38;5;245m'
+RESET = BASE + TEXT
 BOLD = '\033[1m'
 SGR = re.compile(r'\033\[[0-9;]*m')
 INLINE = re.compile(

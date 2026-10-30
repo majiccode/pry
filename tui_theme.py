@@ -1,0 +1,16 @@
+"""Shared terminal palette for the application shell and content renderers."""
+
+BACKGROUND = '\033[48;5;234m'
+TEXT = '\033[38;5;252m'
+MUTED = '\033[38;5;245m'
+ACCENT = '\033[38;5;180m'
+SECONDARY = '\033[38;5;110m'
+BORDER = '\033[38;5;240m'
+SUCCESS = '\033[38;5;150m'
+WARNING = '\033[38;5;215m'
+ERROR = '\033[38;5;203m'
+PANEL = '\033[48;5;235m'
+BASE = '\033[0m' + BACKGROUND + TEXT
+SELECTED = '\033[0;1;38;5;230;48;5;238m'
+BUTTON = '\033[0;38;5;180;48;5;235m'
+FOCUSED_BUTTON = '\033[0;1;38;5;234;48;5;180m'

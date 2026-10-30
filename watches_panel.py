@@ -10,7 +10,8 @@ import tempfile
 import threading
 from datetime import datetime
 
-from git_panel import GitPanel, visible
+from git_panel import GitPanel, visible, field_tail
+from tui_theme import PANEL, BUTTON, FOCUSED_BUTTON
 
 
 class WatchesPanel(GitPanel):
@@ -412,10 +413,10 @@ class WatchesPanel(GitPanel):
         self.zones = []
         first = 2 if height >= 6 else 1
         for row in range(first, height + 1):
-            rendered += f'\033[{row+top};1H' + base + ' ' * cols
+            rendered += f'\033[{row+top};1H' + base + PANEL + ' ' * cols
         def put(row, value, style=muted):
             if 1 <= row <= height:
-                return f'\033[{row+top};1H' + base + style + wrap(visible(value), max(1, cols))[0]
+                return f'\033[{row+top};1H' + base + PANEL + style + wrap(visible(value), max(1, cols))[0]
             return ''
         rendered += put(first, form['summary'], accent)
         capacity = max(0, height - first - 3)
@@ -423,12 +424,21 @@ class WatchesPanel(GitPanel):
         for offset, (name, value) in enumerate(form['fields'][start:start+capacity]):
             index = start + offset
             row = first + offset + 1
-            rendered += put(row, ('> ' if index == form['index'] else '  ') + name + ': ' + value,
+            label = ('> ' if index == form['index'] else '  ') + name + ': '
+            if len(label) > cols // 2:
+                label = label[:max(0, cols // 2 - 2)] + ': '
+            room = max(1, cols - len(label) - 1)
+            if index == form['index']:
+                value = field_tail(value, room)
+            rendered += put(row, label + value,
                             selected if index == form['index'] else text)
             self.zones.append((row+top, 1, cols, 'field', index))
-        rendered += put(height - 1, '[Apply]  Fields scroll with Tab / Shift+Tab', accent)
+        rendered += put(height - 1, '[Apply]', FOCUSED_BUTTON)
         if height >= 3:
             self.zones.append((height-1+top, 1, min(cols, 7), 'submit', None))
+            if cols >= 18:
+                rendered += f'\033[{height-1+top};10H' + base + BUTTON + '[Cancel]' + base
+                self.zones.append((height-1+top, 10, 17, 'cancel_form', None))
         chooser = {'process': ('Choose process', 'choose_process'),
                    'disk': ('Choose filesystem', 'choose_filesystem'),
                    'log': ('Choose files', 'choose_file')}.get(form.get('kind'))
