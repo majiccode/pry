@@ -31,19 +31,25 @@ from local_docs import retrieve as retrieve_docs, for_question as question_docs
 from command_cards import parse_blocks, parameter_names, fill_parameters, preview
 from recipes import RecipeStore
 from context_budget import build_messages
+from model_providers import validate_profile, stream_chat, DEFAULT_SYSTEM
 from git_panel import GitPanel
 from network_panel import NetworkPanel
 from services_panel import ServicesPanel
 from watches import WatchEngine
 from watches_panel import WatchesPanel
+from scratchpad_panel import ScratchpadPanel
+from spotlight_search import SpotlightSearch
 from response_rendering import render_markdown
 from file_preview import render_file_preview
 import investigation
 from tui_theme import (BACKGROUND, BASE, TEXT, MUTED, ACCENT, SECONDARY, BORDER,
-                       PANEL, SUCCESS, WARNING, ERROR, SELECTED, BUTTON, FOCUSED_BUTTON)
+                       PANEL, SUCCESS, WARNING, ERROR, SELECTED, BUTTON, FOCUSED_BUTTON, SEARCH_HIT)
 
 MODEL_NAME = "linux-cmds-7b"
+OLLAMA_MODEL = MODEL_NAME
 OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL_PROFILES = []
+ACTIVE_PROVIDER = ''
 PROJECT_DIR = Path(__file__).resolve().parent
 model_build_active = False
 model_build_output = ''
@@ -61,10 +67,11 @@ git_panel = None
 watch_engine = None
 panels_menu = None
 panels_query = ''
+about_open = False
 session_delete_pending = None
 PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
                ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
-               ('Models', '/models'), ('Sessions', '/bookmarks')]
+               ('Models', '/models'), ('Sessions', '/bookmarks'), ('Scratchpad', '/notes')]
 BLACK_BG, ORANGE, CYAN = BACKGROUND, ACCENT, SECONDARY
 GREY, WHITE, LIGHT_ORANGE = MUTED, TEXT, WARNING
 BASE_STYLE, SELECTED_STYLE = BASE, SELECTED
@@ -76,13 +83,25 @@ def settings_path():
 
 
 def load_model_settings():
-    global MODEL_NAME, EXECUTION_SHELL, COMMAND_TIMEOUT, sidebar_visible
+    global MODEL_NAME, OLLAMA_MODEL, MODEL_PROFILES, ACTIVE_PROVIDER, EXECUTION_SHELL, COMMAND_TIMEOUT, sidebar_visible
     path = settings_path()
     if path.exists():
         settings = json.loads(path.read_text(encoding='utf-8'))
         name = settings.get('model', MODEL_NAME)
-        validate_model_name(name)
+        if not settings.get('model_provider'):
+            validate_model_name(name)
+        OLLAMA_MODEL = settings.get('ollama_model', name if not settings.get('model_provider') else OLLAMA_MODEL)
+        validate_model_name(OLLAMA_MODEL)
         MODEL_NAME = name
+        MODEL_PROFILES = [validate_profile(profile) for profile in settings.get('model_profiles', [])]
+        if len({profile['id'] for profile in MODEL_PROFILES}) != len(MODEL_PROFILES):
+            raise ValueError('Model profile IDs must be unique.')
+        ACTIVE_PROVIDER = settings.get('model_provider', '')
+        if ACTIVE_PROVIDER:
+            profile = next((p for p in MODEL_PROFILES if p['id'] == ACTIVE_PROVIDER), None)
+            if profile is None:
+                raise ValueError('The selected model profile no longer exists.')
+            MODEL_NAME = profile['model']
         shell = settings.get('shell', EXECUTION_SHELL)
         if isinstance(shell, str) and os.path.isfile(shell) and os.access(shell, os.X_OK):
             EXECUTION_SHELL = shell
@@ -113,12 +132,22 @@ def validate_model_name(name):
         raise ValueError('Use a model name containing letters, digits, dots, underscores, slashes, colons or hyphens.')
 
 
-def select_model(name):
-    global MODEL_NAME
-    validate_model_name(name)
+def select_model(name, provider='', profiles=None):
+    global MODEL_NAME, OLLAMA_MODEL, ACTIVE_PROVIDER, MODEL_PROFILES
+    profiles = MODEL_PROFILES if profiles is None else profiles
+    if provider:
+        profile = next((p for p in profiles if p['id'] == provider), None)
+        if profile is None:
+            raise ValueError('Unknown model profile.')
+        name = validate_profile(profile)['model']
+    else:
+        validate_model_name(name)
     path = settings_path()
     settings = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     settings['model'] = name
+    settings['model_provider'] = provider
+    settings['model_profiles'] = profiles
+    settings['ollama_model'] = OLLAMA_MODEL if provider else name
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -130,6 +159,10 @@ def select_model(name):
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
     MODEL_NAME = name
+    ACTIVE_PROVIDER = provider
+    MODEL_PROFILES = profiles
+    if not provider:
+        OLLAMA_MODEL = name
     # A previous model's unfinished response must not block the new model.
     # Its eventual result is ignored because its token is no longer active.
     for session in sessions.values():
@@ -140,6 +173,22 @@ def select_model(name):
             session.active = None
             session.changed()
             session._start_next()
+
+
+def selected_profile():
+    return next((dict(p) for p in MODEL_PROFILES if p['id'] == ACTIVE_PROVIDER), None)
+
+
+def model_diagnostics():
+    profile = selected_profile()
+    if profile is None:
+        return diagnostics(EXECUTION_SHELL, MODEL_NAME, OLLAMA_URL)
+    key = profile['api_key_env']
+    auth = ('configured' if os.environ.get(key) else 'MISSING') if key else 'not required'
+    return (machine_description(EXECUTION_SHELL) + '\n'
+            f'{profile["label"]}: {profile["protocol"]}, {profile["base_url"]}, model {MODEL_NAME}\n'
+            f'API key environment variable: {key or "none"} ({auth}). '
+            'Connectivity is checked on the next chat request; model discovery is not required.')
 
 
 def configure_model(name):
@@ -397,6 +446,8 @@ selected_bookmark = None
 sessions = {}
 browser: dict[str, Any] | None = None
 model_picker: dict[str, Any] | None = None
+main_search_rows = []
+main_search_candidates = []
 inline_focus = None
 inline_control = 'focus'
 inline_tab_stops = []
@@ -416,11 +467,12 @@ COMMANDS = [('/new', 'Start a new conversation'),
             ('/chat', 'Return to the live chat'),
             ('/files', 'Browse files and folders to attach as context'),
             ('/cmd', 'Run a local terminal command'),
-            ('/models', 'Select from models installed in Ollama'),
+            ('/models', 'Select Ollama models or configure compatible APIs'),
             ('/model', 'Show or change the chat model: /model <name>'),
             ('/cfg-model', 'Edit Modelfile and build: /cfg-model <name>'),
             ('/exit', 'Exit the app (alias)')]
 COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>'),
+             ('/notes', 'Open the persistent Markdown scratchpad'),
              ('/panels', 'Choose a workspace from the Panels menu'),
              ('/watch', 'Configure port, process, disk and log watches'),
              ('/services', 'Browse services and prepare start/stop commands'),
@@ -435,7 +487,7 @@ COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>')
              ('/timeout', 'Command timeout in seconds; 0 disables'),
              ('/cd', 'Change session working directory'),
               ('/docs', 'Read/search installed documentation: /docs rsync [search terms]'),
-             ('/doctor', 'Check Ollama, model and local environment'),
+             ('/doctor', 'Check model configuration and local environment'),
              ('/search', 'Filter saved sessions by text; empty resets'),
              ('/rename', 'Rename current conversation'),
              ('/retry', 'Resubmit the last AI question'),
@@ -455,8 +507,8 @@ follow_output = True
 max_scroll_index = 0
 viewport_rows = 1
 ANSI_STYLE = re.compile(r'\033\[[0-9;]*m')
-MOUSE_ON = "\033[?1000h\033[?1002h\033[?1003h\033[?1006h\033[?2004h"
-MOUSE_OFF = "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l"
+MOUSE_ON = "\033[?1000h\033[?1002h\033[?1003h\033[?1006h\033[?2004h\033[>1u"
+MOUSE_OFF = "\033[<u\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l"
 mouse_hover = None
 mouse_selection = None
 mouse_press: dict[str, Any] | None = None
@@ -644,7 +696,7 @@ def initialize_app():
         watch_engine = WatchEngine(workdir / 'watches.json')
     except (OSError, ValueError, TypeError) as exc:
         status_message = f'Watches unavailable: {exc}'
-    threading.Thread(target=lambda: print_queue.put(('STARTUP', '', diagnostics(EXECUTION_SHELL, MODEL_NAME, OLLAMA_URL))),
+    threading.Thread(target=lambda: print_queue.put(('STARTUP', '', model_diagnostics())),
                      daemon=True).start()
 
 
@@ -679,8 +731,8 @@ def make_session(saved=None):
             if not item.get('error'):
                 session._remember(item)
     session.sender = lambda messages, token: threading.Thread(
-        target=query_ollama_worker,
-        args=(messages, token, MODEL_NAME, list(session.paths), session.cwd, session.browse_directory), daemon=True).start()
+        target=query_model_worker,
+        args=(messages, token, MODEL_NAME, list(session.paths), session.cwd, session.browse_directory, selected_profile()), daemon=True).start()
     session.changed = lambda: autosave(session)
     sessions[session.session_id] = session
     return session
@@ -912,11 +964,73 @@ def scroll_focused(amount):
         scroll_view(amount)
 
 
+def jump_main_search(target):
+    global scroll_top_index, follow_output, bookmark_scroll_index
+    kind, index = target
+    if kind == 'chat':
+        scroll_top_index = max(0, min(max_scroll_index, index - viewport_rows // 2))
+        follow_output = False
+    elif kind == 'bookmarks':
+        bookmark_scroll_index = max(0, min(bookmark_max_scroll, index))
+    elif kind == 'files' and browser is not None:
+        browser['index'], browser['top'] = index, index
+    elif kind == 'models' and model_picker is not None:
+        model_picker['index'], model_picker['top'] = index, index
+
+
+main_search = SpotlightSearch(on_jump=jump_main_search)
+
+
+def open_main_search(refresh=False):
+    """Use physical transcript rows, never indexes into filtered nonempty rows."""
+    global main_search_candidates
+    if model_picker is not None:
+        candidates = [(f'{p["label"]} / {p["model"]} [{p.get("protocol", "ollama")}]', ('models', i))
+                      for i, p in enumerate(model_picker['models'])]
+        current = model_picker['index']
+        title = 'Find Models'
+    elif browser is not None:
+        candidates = [(p.name, ('files', i)) for i, p in enumerate(browser['entries'])]
+        current = browser['index']
+        title = 'Find Files'
+    elif active_pane == 'bookmarks':
+        candidates = []
+        for i, item in enumerate(visible_bookmarks()):
+            target = ('bookmarks', i)
+            candidates.append((item.get('name') or item.get('prompt', ''), target))
+            for turn in item.get('history', []):
+                for key in ('prompt', 'response', 'execution_output'):
+                    candidates.extend((line, target) for line in str(turn.get(key, '')).splitlines())
+        current = next((i for i, (_, target) in enumerate(candidates)
+                        if target[1] >= bookmark_scroll_index), len(candidates))
+        title = 'Find Sessions'
+    else:
+        candidates = [(ANSI_STYLE.sub('', line), ('chat', i)) for i, line in enumerate(main_search_rows)]
+        current = scroll_top_index
+        title = 'Find Chat'
+    if refresh and candidates == main_search_candidates:
+        return
+    selected = None
+    if refresh and main_search.index >= 0:
+        candidate, start, end = main_search.matches[main_search.index]
+        selected = (candidate, start, end, main_search_candidates[candidate])
+    main_search_candidates = candidates
+    main_search.title = title
+    main_search.open(candidates, current)
+    if selected is not None:
+        old_candidate, old_start, old_end, old_entry = selected
+        for i, (candidate, start, end) in enumerate(main_search.matches):
+            if (candidate, start, end) == (old_candidate, old_start, old_end) and candidates[candidate] == old_entry:
+                main_search.index = i
+                jump_main_search(candidates[candidate][1])
+                break
+
+
 def open_model_picker():
     global model_picker
     request = uuid4().hex
-    model_picker = dict(request=request, models=[], index=0, top=0, loading=True,
-                        message='Loading installed Ollama models...')
+    model_picker = dict(request=request, models=[dict(p) for p in MODEL_PROFILES], index=0, top=0, loading=True,
+                        form=None, message='Loading Ollama models; saved API profiles are available now.')
     threading.Thread(target=load_models_worker, args=(request,), daemon=True).start()
 
 
@@ -940,11 +1054,11 @@ def load_models_worker(request):
 
 def choose_picker_model():
     global model_picker, status_message
-    if model_picker is None or model_picker['loading'] or not model_picker['models']:
+    if model_picker is None or not model_picker['models']:
         return
-    name = model_picker['models'][model_picker['index']]
+    profile = model_picker['models'][model_picker['index']]
     try:
-        select_model(name)
+        select_model(profile['model'], profile['id'])
     except (OSError, ValueError, TypeError) as exc:
         model_picker['message'] = f'Cannot select model: {exc}'
         return
@@ -952,13 +1066,96 @@ def choose_picker_model():
     status_message = f'Chat model changed to {MODEL_NAME} (saved locally).'
 
 
+def open_model_form(edit=False):
+    assert model_picker is not None
+    entries = model_picker['models']
+    profile = entries[model_picker['index']] if edit and entries else None
+    if edit and (not profile or not profile['id']):
+        model_picker['message'] = 'Ollama models are managed with ollama pull and /cfg-model.'
+        return
+    profile = profile or dict(id=uuid4().hex, label='', protocol='openai',
+                              base_url='https://api.openai.com/v1', model='', api_key_env='OPENAI_API_KEY')
+    model_picker['form'] = dict(profile=dict(profile), index=0, message='')
+
+
+def handle_model_form_event(event, value):
+    global model_picker, status_message
+    form = model_picker['form']
+    fields = ['label', 'protocol', 'base_url', 'model', 'api_key_env']
+    profile = form['profile']
+    key = fields[form['index']]
+    if event == 'escape' or event == 'key' and value == '\x03':
+        model_picker['form'] = None
+    elif event == 'pane' or event == 'key' and value == '\t':
+        form['index'] = (form['index'] + (-1 if event == 'pane' else 1)) % len(fields)
+    elif event == 'click':
+        x, y = value
+        for (row, left, right), (action, index) in click_zones.items():
+            if row == y and left <= x <= right:
+                if action == 'model_field':
+                    form['index'] = index
+                    if fields[index] == 'protocol':
+                        handle_model_form_event('key', ' ')
+                elif action == 'model_save':
+                    handle_model_form_event('key', '\r')
+                elif action == 'picker_close':
+                    handle_model_form_event('escape', None)
+                break
+    elif event == 'key' and value == '\r':
+        try:
+            saved = validate_profile(profile)
+            profiles = [saved if p['id'] == saved['id'] else p for p in MODEL_PROFILES]
+            if not any(p['id'] == saved['id'] for p in profiles):
+                profiles.append(saved)
+            select_model(saved['model'], saved['id'], profiles)
+        except (OSError, ValueError, TypeError) as exc:
+            form['message'] = str(exc)
+            return
+        model_picker = None
+        status_message = f'Saved and selected {saved["label"]}: {saved["model"]}.'
+    elif key == 'protocol' and (event in ('scroll', 'cursor') or event == 'key' and value == ' '):
+        protocol = 'anthropic' if profile['protocol'] == 'openai' else 'openai'
+        defaults = {'openai': ('https://api.openai.com/v1', 'OPENAI_API_KEY'),
+                    'anthropic': ('https://api.anthropic.com/v1', 'ANTHROPIC_API_KEY')}
+        previous = defaults[profile['protocol']]
+        if profile['base_url'] == previous[0]:
+            profile['base_url'] = defaults[protocol][0]
+        if profile['api_key_env'] == previous[1]:
+            profile['api_key_env'] = defaults[protocol][1]
+        profile['protocol'] = protocol
+    elif key != 'protocol' and event == 'key' and value in ('\x7f', '\x08'):
+        profile[key] = profile[key][:-1]
+    elif key != 'protocol' and event == 'key' and value == '\x15':
+        profile[key] = ''
+    elif key != 'protocol' and event in ('key', 'paste') and isinstance(value, str):
+        profile[key] = (profile[key] + ''.join(c for c in value if c.isprintable()))[:2048]
+
+
 def handle_model_picker_event(event, value):
     global model_picker
     assert model_picker is not None
-    if event == 'escape':
+    if model_picker.get('form'):
+        handle_model_form_event(event, value)
+        return
+    if event == 'escape' or event == 'key' and value == '\x03':
         model_picker = None
     elif event == 'key' and value == 'r':
         open_model_picker()
+    elif event == 'key' and value in ('a', 'e'):
+        open_model_form(edit=value == 'e')
+    elif event == 'key' and value == 'd' and model_picker['models']:
+        profile = model_picker['models'][model_picker['index']]
+        if profile['id'] == ACTIVE_PROVIDER and ACTIVE_PROVIDER:
+            model_picker['message'] = 'Select another model before removing the active API profile.'
+        elif profile['id']:
+            profiles = [p for p in MODEL_PROFILES if p['id'] != profile['id']]
+            try:
+                save_setting('model_profiles', profiles)
+            except (OSError, ValueError) as exc:
+                model_picker['message'] = f'Cannot remove profile: {exc}'
+                return
+            MODEL_PROFILES[:] = profiles
+            open_model_picker()
     elif event == 'key' and value == '\r':
         choose_picker_model()
     elif event in ('scroll', 'wheel', 'page', 'home', 'end'):
@@ -979,6 +1176,10 @@ def handle_model_picker_event(event, value):
                     choose_picker_model()
                 elif action == 'picker_refresh':
                     open_model_picker()
+                elif action == 'picker_add':
+                    open_model_form()
+                elif action == 'picker_edit':
+                    open_model_form(edit=True)
                 elif action == 'picker_close':
                     model_picker = None
                 break
@@ -990,26 +1191,60 @@ def draw_model_picker(cols, rows):
     sys.stdout.write(BASE_STYLE + '\033[H\033[2J')
     draw_pry_header(cols)
     rows = max(0, rows - 1)
-    def put(row, text, color=GREY):
+    def put(row, text, color=GREY, search=False):
         if 1 <= row <= rows:
-            sys.stdout.write(f'\033[{row+1};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
-    put(1, ' Models / choose your local AI', PANEL + WHITE)
-    put(2, f' {len(model_picker["models"])} installed | Current: {MODEL_NAME}')
-    height = max(0, rows - 5)
+            line = wrap_terminal_line(BASE_STYLE + color + text, cols)[0]
+            sys.stdout.write(f'\033[{row+1};1H' + (main_search.highlight(line) if search else line))
+    put(1, ' Models / local and compatible APIs', PANEL + WHITE)
+    if model_picker.get('form'):
+        form = model_picker['form']
+        labels = [('label', 'Name'), ('protocol', 'Protocol'),
+                  ('base_url', 'Base URL'), ('model', 'Model ID'), ('api_key_env', 'Key env')]
+        put(2, ' Configure API model | Tab/Shift-Tab: field | Ctrl-U: clear | Enter: save + select')
+        # Scroll fields on short terminals so the focused field remains visible.
+        compact = rows < 10
+        height = max(0, rows - (5 if compact else 7))
+        top = max(0, form['index'] - height + 1)
+        for offset, (key, label) in enumerate(labels[top:top + height]):
+            index = top + offset
+            prefix = f' {label}: '
+            available = max(1, cols - len(prefix) - 2)
+            text = prefix + form['profile'][key][-available:]
+            if index == form['index']:
+                text += ' _'
+            put(offset + 3, text, SELECTED_STYLE if index == form['index'] else WHITE)
+            click_zones[(offset + 4, 1, cols)] = ('model_field', index)
+        if not compact:
+            put(rows - 4, ' Keys stay in your environment, not settings. Set the variable before starting this app.')
+            put(rows - 3, ' Privacy: chat, local machine context, output and attached files go to this endpoint.', WARNING)
+        put(rows - 2, form['message'], ERROR)
+        put(rows - 1, BUTTON_STYLE + ' Save + Select (Enter) ' + BASE_STYLE)
+        put(rows, BUTTON_STYLE + ' Cancel (Esc) ' + BASE_STYLE)
+        click_zones[(rows, 1, min(cols, 23))] = ('model_save', 0)
+        click_zones[(rows + 1, 1, min(cols, 14))] = ('picker_close', 0)
+        sys.stdout.flush()
+        return
+    put(2, f' Current: {MODEL_NAME} | {"API" if ACTIVE_PROVIDER else "Ollama"}')
+    height = max(0, rows - 6)
     model_picker['top'] = min(model_picker['top'], model_picker['index'])
     if height and model_picker['index'] >= model_picker['top'] + height:
         model_picker['top'] = model_picker['index'] - height + 1
-    for offset, name in enumerate(model_picker['models'][model_picker['top']:model_picker['top'] + height]):
+    for offset, profile in enumerate(model_picker['models'][model_picker['top']:model_picker['top'] + height]):
         index = model_picker['top'] + offset
-        put(offset + 3, (f'{">" if index == model_picker["index"] else " "} {name}' + ('  (current)' if name == MODEL_NAME else '')).ljust(cols),
-             SELECTED_STYLE if index == model_picker['index'] else ORANGE)
+        name = f'{profile["label"]} / {profile["model"]} [{profile.get("protocol", "ollama")}]'
+        current = profile['id'] == ACTIVE_PROVIDER and profile['model'] == MODEL_NAME
+        put(offset + 3, (f'{">" if index == model_picker["index"] else " "} {name}' + ('  (current)' if current else '')).ljust(cols),
+             SELECTED_STYLE if index == model_picker['index'] else ORANGE, search=True)
         click_zones[(offset + 4, 1, cols)] = ('picker_model', index)
     if not model_picker['models'] and height:
-        put(3, ' Loading models...' if model_picker['loading'] else ' No models found. Use ollama pull <model> to install one.')
+        put(3, ' Loading models...' if model_picker['loading'] else ' No models found. Add an API profile or use ollama pull <model>.')
+    put(rows - 3, BUTTON_STYLE + ' Add API (a) ' + BASE_STYLE + ' ' + BUTTON_STYLE + ' Edit API (e) ' + BASE_STYLE + '  d: remove API')
     put(rows - 2, model_picker['message'])
     put(rows - 1, BUTTON_STYLE + ' Refresh (r) ' + BASE_STYLE)
     put(rows, BUTTON_STYLE + ' Close (Esc) ' + BASE_STYLE + '  Up/Down: move | Enter/click: select')
     if rows >= 5:
+        click_zones[(rows - 2, 1, min(cols, 13))] = ('picker_add', 0)
+        click_zones[(rows - 2, 15, min(cols, 28))] = ('picker_edit', 0)
         click_zones[(rows, 1, min(cols, len(' Refresh (r) ')))] = ('picker_refresh', 0)
         click_zones[(rows + 1, 1, min(cols, len(' Close (Esc) ')))] = ('picker_close', 0)
     sys.stdout.flush()
@@ -1064,6 +1299,10 @@ def handle_submission(text):
             assert conversation is not None
             if verb == '/panels':
                 panels_menu = 0
+            elif verb == '/notes':
+                git_panel = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
+                                           clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
+                                           open_url=webbrowser.open)
             elif verb == '/watch':
                 if watch_engine is None:
                     raise ValueError('Watches unavailable; check the work directory and restart.')
@@ -1148,8 +1387,8 @@ def handle_submission(text):
                     print_queue.put(('LOCAL_RESULT', token, result))
                 threading.Thread(target=docs_worker, daemon=True).start()
             elif verb == '/doctor':
-                threading.Thread(target=lambda: print_queue.put(('STARTUP', '', diagnostics(EXECUTION_SHELL, MODEL_NAME, OLLAMA_URL))), daemon=True).start()
-                status_message = 'Checking local environment and Ollama...'
+                threading.Thread(target=lambda: print_queue.put(('STARTUP', '', model_diagnostics())), daemon=True).start()
+                status_message = 'Checking local environment and model configuration...'
             elif verb == '/search':
                 session_filter = argument.casefold()
                 active_pane = 'bookmarks'
@@ -1217,7 +1456,7 @@ def handle_submission(text):
     elif command == '/model' or command.startswith('/model '):
         name = text[6:].strip()
         if not name:
-            status_message = f'Current model: {MODEL_NAME} | /model <name> to change'
+            status_message = f'Current model: {MODEL_NAME} | /models: all providers | /model <name>: Ollama'
         else:
             try:
                 select_model(name)
@@ -1225,6 +1464,9 @@ def handle_submission(text):
             except (OSError, ValueError, TypeError) as exc:
                 status_message = f'Cannot select model: {exc}'
     elif command == '/cfg-model' or command.startswith('/cfg-model '):
+        if ACTIVE_PROVIDER:
+            status_message = '/cfg-model builds Ollama models only. Select an Ollama model in /models first.'
+            return
         try:
             configure_model(text[10:].strip() or MODEL_NAME)
         except (OSError, ValueError) as exc:
@@ -1303,10 +1545,13 @@ def process_results():
             continue
         if status == 'MODELS':
             if model_picker is not None and model_picker['request'] == token:
-                models = data['models']
+                models = [dict(p) for p in MODEL_PROFILES] + [
+                    dict(id='', label='Ollama', model=name) for name in data['models']]
+                selected = next((i for i, p in enumerate(models)
+                                 if p['id'] == ACTIVE_PROVIDER and p['model'] == MODEL_NAME), 0)
                 model_picker.update(models=models, loading=False,
-                                    index=models.index(MODEL_NAME) if MODEL_NAME in models else 0,
-                                    top=0, message=data['error'] or (f'{len(models)} installed models' if models else 'No models installed. Use ollama pull <name>, then Refresh.'))
+                                    index=selected, top=0,
+                                    message=data['error'] or f'{len(models)} models available. API model IDs are configured manually.')
                 updated = True
             continue
         if status == 'MODEL_BUILD':
@@ -1424,6 +1669,12 @@ def read_input_event(fd):
         return ('paste', data[:-6].decode('utf-8', errors='replace'))
     keys = {b'A': ('scroll', -1), b'B': ('scroll', 1),
             b'C': ('cursor', 1), b'D': ('cursor', -1),
+            b'1;2C': ('select_cursor', 1), b'1;2D': ('select_cursor', -1),
+            b'1;2A': ('select_scroll', -1), b'1;2B': ('select_scroll', 1),
+            b'1;2H': ('select_home', None), b'1;2F': ('select_end', None),
+            b'1;5H': ('document_home', None), b'1;5F': ('document_end', None),
+            b'1;6H': ('select_document_home', None), b'1;6F': ('select_document_end', None),
+            b'5;2~': ('select_page', -1), b'6;2~': ('select_page', 1),
             b'Z': ('pane', None), b'3~': ('delete', None),
             b'13;3u': ('newline', None), b'27;3;13~': ('newline', None),
             b'5~': ('page', -1), b'6~': ('page', 1),
@@ -1431,6 +1682,57 @@ def read_input_event(fd):
             b'F': ('end', None), b'4~': ('end', None), b'8~': ('end', None)}
     if sequence in keys:
         return keys[sequence]
+    if prefix == b'[':
+        navigation_key = re.fullmatch(rb'1;(\d+)([ABCDHF])', sequence)
+        if navigation_key:
+            bits = int(navigation_key[1]) - 1
+            kind, argument = {b'A': ('scroll', -1), b'B': ('scroll', 1),
+                              b'C': ('cursor', 1), b'D': ('cursor', -1),
+                              b'H': ('home', None), b'F': ('end', None)}[navigation_key[2]]
+            if bits & (8 | 32):
+                kind = 'home' if navigation_key[2] == b'D' else 'end' if navigation_key[2] == b'C' else (
+                    'document_home' if navigation_key[2] in (b'A', b'H') else 'document_end')
+                argument = None
+            elif bits & 4 and kind in ('home', 'end'):
+                kind = 'document_' + kind
+            return (('select_' if bits & 1 else '') + kind, argument)
+        extended = re.fullmatch(rb'(\d+)(?::[\d:]+)?(?:;(\d+)(?::([123]))?)?u', sequence)
+        legacy = re.fullmatch(rb'27;(\d+);(\d+)~', sequence)
+        if extended or legacy:
+            code, modifier = (int(extended[1]), int(extended[2] or b'1')) if extended else (int(legacy[2]), int(legacy[1]))
+            if extended and extended[3] == b'3':
+                return ('ignore', None)
+            bits = modifier - 1
+            command, control, shift = bool(bits & (8 | 32)), bool(bits & 4), bool(bits & 1)
+            if command or control:
+                letter = chr(code).lower() if 0 <= code <= 0x10ffff else ''
+                shortcuts = {'a': '\x01', 'c': '\x03', 'x': '\x18', 'v': '\x16',
+                             'z': '\x1a', 'y': '\x19', 's': '\x13', 'f': '\x06'}
+                if letter in shortcuts:
+                    return ('key', '\x19' if letter == 'z' and shift else shortcuts[letter])
+                if control and len(letter) == 1 and 'a' <= letter <= 'z':
+                    return ('key', chr(ord(letter) - ord('a') + 1))
+            navigation = {57350: ('cursor', -1), 57351: ('cursor', 1),
+                          57352: ('scroll', -1), 57353: ('scroll', 1),
+                          57356: ('home', None), 57357: ('end', None),
+                          57354: ('page', -1), 57355: ('page', 1)}
+            if code in navigation:
+                kind, argument = navigation[code]
+                if command:
+                    kind = 'home' if code == 57350 else 'end' if code == 57351 else (
+                        'document_home' if code in (57352, 57356) else 'document_end')
+                    argument = None
+                elif control and kind in ('home', 'end'):
+                    kind = 'document_' + kind
+                return (('select_' if shift else '') + kind, argument)
+            if not bits or bits == 1:
+                if code in (8, 9, 13, 27, 127):
+                    if code == 9 and shift:
+                        return ('pane', None)
+                    return ('escape', None) if code == 27 else ('key', chr(code))
+                if 32 <= code < 0x110000:
+                    return ('key', chr(code))
+            return ('ignore', None)
     if prefix == b'[' and sequence == b'M':
         report = b''.join(next_byte() for _ in range(3))
         if len(report) != 3:
@@ -1457,7 +1759,7 @@ def read_input_event(fd):
     if (button & ~28) == 3:
         return ('release', (x, y))
     if (button & ~28) == 0:
-        return ('click', (x, y))
+        return ('link_click' if button & 16 else 'click', (x, y))
     return ('ignore', None)
 
 
@@ -1471,14 +1773,17 @@ def insert_input(text):
     reset_completion()
 
 
+def read_clipboard():
+    result = subprocess.run(clipboard_command(paste=True), capture_output=True, text=True, timeout=5)
+    if result.returncode:
+        raise OSError(result.stderr.strip() or 'Clipboard could not be read')
+    return result.stdout
+
+
 def paste_clipboard():
     global status_message
     try:
-        command = clipboard_command(paste=True)
-        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
-        if result.returncode:
-            raise OSError(result.stderr.strip() or 'Clipboard could not be read')
-        insert_input(result.stdout)
+        insert_input(read_clipboard())
     except (OSError, subprocess.SubprocessError) as exc:
         status_message = f'Paste unavailable: {exc}'
 
@@ -1713,29 +2018,32 @@ def recipe_command(verb, argument):
             raise ValueError('Unknown recipe action. /recipe shows syntax.')
 
 
-def query_ollama_worker(messages, index, model=None, paths=None, cwd=None, browse_directory=None):
+def query_model_worker(messages, index, model=None, paths=None, cwd=None, browse_directory=None, profile=None):
     """Fetches AI completion responses on an isolated background thread."""
     try:
-        _query_ollama(messages, index, model, paths, cwd, browse_directory)
+        _query_model(messages, index, model, paths, cwd, browse_directory, profile)
     except Exception as exc:
         print_queue.put(('ERROR', index, f'{model or MODEL_NAME}: {exc}'))
 
 
-def _query_ollama(messages, index, model, paths, cwd, browse_directory):
+def _query_model(messages, index, model, paths, cwd, browse_directory, profile=None):
     selected_model = model or MODEL_NAME
+    session = next((s for s in sessions.values() if s.active == index), None)
     # An explicit chat system message replaces Ollama's Modelfile SYSTEM.
     # Preserve the selected model's instructions before adding local context.
-    show_request = urllib.request.Request(
-        OLLAMA_URL.rsplit('/api/', 1)[0] + '/api/show',
-        data=json.dumps({'model': selected_model}).encode('utf-8'),
-        headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(show_request, timeout=10) as response:
-        model_info = json.load(response)
-    if model_info.get('error'):
-        raise ValueError(model_info['error'])
-    model_system = model_info.get('system', '')
-    if not isinstance(model_system, str):
-        raise ValueError('Ollama returned an invalid model system prompt')
+    model_system = DEFAULT_SYSTEM
+    if profile is None:
+        show_request = urllib.request.Request(
+            OLLAMA_URL.rsplit('/api/', 1)[0] + '/api/show',
+            data=json.dumps({'model': selected_model}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(show_request, timeout=10) as response:
+            model_info = json.load(response)
+        if model_info.get('error'):
+            raise ValueError(model_info['error'])
+        model_system = model_info.get('system', '')
+        if not isinstance(model_system, str):
+            raise ValueError('Ollama returned an invalid model system prompt')
     instruction = (machine_description(EXECUTION_SHELL) + '\n'
                    'Shell commands run in separate shell processes. Working directory persists; exported variables and aliases do not. '
                    'Use ```sh or ```bash for executable blocks; use an accurate non-shell language for configuration/output. '
@@ -1793,7 +2101,6 @@ def _query_ollama(messages, index, model, paths, cwd, browse_directory):
     instruction = (model_system.strip() + '\n\n' if model_system.strip() else '') + (
         'Application context (subject to the model scope and rules above):\n' + instruction)
     latest = messages[-1]['content'] if messages else ''
-    session = next((s for s in sessions.values() if s.active == index), None)
     manuals = []
     active_position = 0
     if session:
@@ -1831,18 +2138,34 @@ def _query_ollama(messages, index, model, paths, cwd, browse_directory):
                 + message['content']))
         grouped.append(message)
     print_queue.put(('CONTEXT_REPORT', index, notice))
+    if session is not None and session.active != index:
+        return
+    if profile is not None:
+        ai_text = ''
+        for delta in stream_chat(profile, grouped):
+            if session is not None and session.active != index:
+                return
+            ai_text += delta
+            print_queue.put(('PARTIAL', index, ai_text))
+        print_queue.put(('SUCCESS', index, ai_text.strip()))
+        return
     payload = {
         "model": selected_model,
         "messages": grouped,
         "stream": True,
         "options": {"num_ctx": 8192, "num_predict": 1800}
     }
+    # Thinking shares the generation budget and can exhaust it before an answer.
+    # Only disable it when the model advertises support for that control.
+    if any(value is False for value in model_info.get('thinking', {}).get('values', [])):
+        payload['think'] = False
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(OLLAMA_URL, data=data, headers={'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=120) as response:
             ai_text = ''
             done = False
+            had_thinking = False
             for line in response:
                 if session is not None and session.active != index:
                     return
@@ -1851,8 +2174,11 @@ def _query_ollama(messages, index, model, paths, cwd, browse_directory):
                 res = json.loads(line.decode('utf-8'))
                 if res.get('error'):
                     raise ValueError(res['error'])
-                ai_text += res.get('message', {}).get('content', '')
-                if ai_text:
+                message = res.get('message', {})
+                had_thinking = had_thinking or bool(message.get('thinking'))
+                delta = message.get('content', '')
+                ai_text += delta
+                if delta:
                     print_queue.put(('PARTIAL', index, ai_text))
                 if res.get('done'):
                     done = True
@@ -1861,6 +2187,11 @@ def _query_ollama(messages, index, model, paths, cwd, browse_directory):
                 raise ValueError('Ollama closed the response before completion')
             ai_text = ai_text.strip()
             if not ai_text:
+                if res.get('done_reason') == 'length':
+                    raise ValueError('Ollama reached the generation limit before returning an answer'
+                                     + ('; the model used the budget for thinking' if had_thinking else ''))
+                if had_thinking:
+                    raise ValueError('Ollama returned thinking output but no final answer')
                 raise ValueError('Ollama returned an empty response')
             print_queue.put(("SUCCESS", index, ai_text))
     except Exception as e:
@@ -2495,7 +2826,7 @@ def build_transcript(history, width, saved=False):
         add('/git            Review changes and branches', CYAN)
         add('/               Explore commands as you type', CYAN)
         add('')
-        add('Local AI via Ollama. Model replies never run commands automatically.')
+        add('AI via Ollama or compatible APIs. Model replies never run commands automatically.')
     for index, item in enumerate(history):
         boundary = selected_bookmark.get('topic_start', 0) if saved and selected_bookmark else conversation.topic_start if conversation else 0
         if index == boundary and boundary:
@@ -2562,9 +2893,10 @@ def draw_file_browser(cols, rows):
     sys.stdout.write(BASE_STYLE + '\033[H\033[2J')
     draw_pry_header(cols)
     rows = max(0, rows - 1)
-    def put(row, text, color=GREY):
+    def put(row, text, color=GREY, search=False):
         if 1 <= row <= rows:
-            sys.stdout.write(f'\033[{row+1};1H' + wrap_terminal_line(BASE_STYLE + color + text, cols)[0])
+            line = wrap_terminal_line(BASE_STYLE + color + text, cols)[0]
+            sys.stdout.write(f'\033[{row+1};1H' + (main_search.highlight(line) if search else line))
     put(1, f' Files / {browser["directory"]}', PANEL + WHITE)
     put(2, f' {len(browser["selected"])} selected | Space selects | Enter opens | Text files only')
     height = max(0, rows - 6)
@@ -2586,7 +2918,7 @@ def draw_file_browser(cols, rows):
         label = f'{marker} [{selected}] {path.name}{"/" if path.is_dir() else ""}'
         if reason:
             label += f' (unavailable: {reason})'
-        put(offset + 3, label.ljust(cols), SELECTED_STYLE if index == browser['index'] else GREY if reason else WHITE)
+        put(offset + 3, label.ljust(cols), SELECTED_STYLE if index == browser['index'] else GREY if reason else WHITE, search=True)
         click_zones[(offset + 4, 1, cols)] = ('browser_entry', index)
     if not browser['entries'] and height:
         put(3, ' This directory is empty. Backspace goes to its parent.')
@@ -2607,15 +2939,24 @@ def redraw_screen():
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         render_screen()
+        if main_search.active:
+            try:
+                cols, rows = os.get_terminal_size()
+            except OSError:
+                cols, rows = 80, 24
+            sys.stdout.write(main_search.draw(cols, rows, wrap_terminal_line,
+                                             (BASE_STYLE, GREY, WHITE, CYAN, SEARCH_HIT)))
         if panels_menu is not None:
             draw_panels_menu()
+        if about_open:
+            draw_about_modal()
     frame = output.getvalue()
-    sys.stdout.write('\033[?2026h' + frame + hover_overlay(frame) + '\033[?2026l')
+    sys.stdout.write('\033[?2026h' + frame + ('' if main_search.active or about_open else hover_overlay(frame)) + '\033[?2026l')
     sys.stdout.flush()
 
 
 def hover_region(position):
-    if position is None:
+    if position is None or about_open:
         return None
     x, y = position
     zones = ([(row, left, right, (action, argument)) for row, left, right, action, argument in git_panel.zones]
@@ -2701,6 +3042,8 @@ def draw_pry_header(cols, controls=False):
 
     put(1, ' ' * cols, cols)
     actions = [('Panels ^K', 'panels')] if cols >= 20 else []
+    if cols >= 40:
+        actions.append(('About', 'about'))
     right = cols + 1
     for label, action in reversed(actions):
         text = f' {label} '
@@ -2722,7 +3065,8 @@ def draw_pry_header(cols, controls=False):
         triggered = sum(bool(item['events']) for item in watch_engine.items)
         if running or triggered:
             watching = f' | {running} watches / {triggered} alerts'
-    workspace = ('Watches' if isinstance(git_panel, WatchesPanel) else
+    workspace = ('Scratchpad' if isinstance(git_panel, ScratchpadPanel) else
+                 'Watches' if isinstance(git_panel, WatchesPanel) else
                  'Services' if isinstance(git_panel, ServicesPanel) else
                  'Network' if isinstance(git_panel, NetworkPanel) else
                  'Git' if git_panel else 'Files' if browser else 'Models' if model_picker else 'Chat')
@@ -2743,6 +3087,45 @@ def draw_pry_header(cols, controls=False):
             directory = '...' + tail
         label += ' | ' + directory
     put(1, label, available, ORANGE)
+
+
+def draw_about_modal():
+    try:
+        cols, rows = os.get_terminal_size()
+    except OSError:
+        cols, rows = 80, 24
+    cols, rows = max(1, cols), max(1, rows)
+    width = min(56, cols)
+    padding = 2 if width >= 8 else 0
+    inner = max(1, width - 2 * padding)
+    body = wrap_terminal_line(
+        'Pry is an AI-powered terminal workspace for asking questions, '
+        'exploring your machine, inspecting command output, and keeping notes.', inner)
+    height = min(rows, len(body) + 6)
+    left, top = (cols - width) // 2 + 1, (rows - height) // 2 + 1
+    # Only the modal owns mouse actions until it closes.
+    click_zones.clear()
+    sys.stdout.write('\0337')
+    for offset in range(height):
+        sys.stdout.write(f'\033[{top+offset};{left}H' + BASE_STYLE + PANEL + ' ' * width)
+
+    def put(offset, text, style):
+        sys.stdout.write(f'\033[{top+offset};{left+padding}H' +
+                         wrap_terminal_line(BASE_STYLE + PANEL + style + text, inner)[0])
+
+    if height >= 4:
+        put(0, 'About Pry', ORANGE)
+        for offset, line in enumerate(body[:max(0, height - 5)], 2):
+            put(offset, line, WHITE)
+    if height >= 3:
+        put(height - 3, '(c) Paul Adams', WHITE)
+    if height >= 2:
+        put(height - 2, 'Esc / Enter to close', GREY)
+    close = '[ Close ]'[:inner]
+    put(height - 1, close, BUTTON_STYLE)
+    click_zones[(top + height - 1, left + padding,
+                 left + padding + len(close) - 1)] = ('about_close', 0)
+    sys.stdout.write('\0338\033[?25l')
 
 
 def panel_matches():
@@ -2771,7 +3154,7 @@ def draw_panels_menu():
         entries.append((f' {index+1}  {label:<12} {command}', SELECTED_STYLE if index == panels_menu else PANEL + WHITE))
     if not matches:
         entries.append((' No matching workspaces', GREY))
-    entries.append((' Enter open | Esc close | 1-8 jump', GREY))
+    entries.append((f' Enter open | Esc close | 1-{len(PANEL_ITEMS)} jump', GREY))
     for offset, (text, style) in enumerate(entries[:height]):
         sys.stdout.write(f'\033[{top+offset};{left}H' + wrap_terminal_line(BASE_STYLE + PANEL + style + text.ljust(width), width)[0])
         if 2 <= offset < 2 + len(visible):
@@ -2786,6 +3169,9 @@ def choose_panel(index):
         status_message = 'Wait for the panel operation or cancel it before switching panels.'
         git_panel.message = status_message
         return
+    if isinstance(git_panel, ScratchpadPanel) and not git_panel.save_position():
+        status_message = git_panel.message
+        return
     git_panel, browser, model_picker = None, None, None
     handle_submission(PANEL_ITEMS[index][1])
 
@@ -2795,6 +3181,7 @@ def render_screen():
     global scroll_top_index, max_scroll_index, viewport_rows, follow_output
     global bookmark_scroll_index, bookmark_max_scroll, sidebar_start
     global chat_screen_width, input_screen_start, screen_columns
+    global main_search_rows
     click_zones.clear()
     inline_screen_regions.clear()
     chat_screen_rows.clear()
@@ -2806,14 +3193,20 @@ def render_screen():
     if git_panel is not None:
         sys.stdout.write(git_panel.draw(cols, rows, wrap_terminal_line,
                                        (BASE_STYLE, GREY, WHITE, CYAN, SELECTED_STYLE), top=1))
+        sys.stdout.write('\0337')
         draw_pry_header(cols)
+        sys.stdout.write('\0338')
         sys.stdout.flush()
         return
     sys.stdout.write('\033[?25h')
     if model_picker is not None:
+        if main_search.active:
+            open_main_search(refresh=True)
         draw_model_picker(cols, rows)
         return
     if browser is not None:
+        if main_search.active:
+            open_main_search(refresh=True)
         draw_file_browser(cols, rows)
         return
     prefix_width = 5 if cols >= 6 else 0
@@ -2835,7 +3228,12 @@ def render_screen():
     chat_screen_width = chat_width
     history = selected_bookmark['history'] if selected_bookmark else session_history
     lines, zones = build_transcript(history, chat_width, selected_bookmark is not None)
+    main_search_rows = lines
     max_scroll_index = max(0, len(lines) - height)
+    saved_items = visible_bookmarks()
+    bookmark_max_scroll = max(0, len(saved_items) - height)
+    if main_search.active:
+        open_main_search(refresh=True)
     for item in history:
         view = item.get('_inline', {})
         if view.pop('reveal_content', False) and not view.get('collapsed'):
@@ -2846,14 +3244,13 @@ def render_screen():
             follow_output = False
     scroll_top_index = max_scroll_index if follow_output else min(scroll_top_index, max_scroll_index)
     scroll_top_index = max(0, scroll_top_index)
-    if scroll_top_index == max_scroll_index:
+    if scroll_top_index == max_scroll_index and not main_search.active:
         follow_output = True
-    saved_items = visible_bookmarks()
-    bookmark_max_scroll = max(0, len(saved_items) - height)
     bookmark_scroll_index = min(bookmark_scroll_index, bookmark_max_scroll)
 
-    def put(row, col, text, width, color=GREY):
-        sys.stdout.write(f'\033[{row};{col}H' + wrap_terminal_line(BASE_STYLE + color + text, width)[0])
+    def put(row, col, text, width, color=GREY, search=False):
+        line = wrap_terminal_line(BASE_STYLE + color + text, width)[0]
+        sys.stdout.write(f'\033[{row};{col}H' + (main_search.highlight(line) if search else line))
 
     sys.stdout.write(BASE_STYLE + '\033[H\033[2J')
     if rows >= 2:
@@ -2875,7 +3272,7 @@ def render_screen():
             absolute = scroll_top_index + offset
             if absolute < len(lines):
                 chat_screen_rows[screen_row] = lines[absolute]
-                sys.stdout.write(f'\033[{screen_row};1H' + lines[absolute])
+                sys.stdout.write(f'\033[{screen_row};1H' + main_search.highlight(lines[absolute]))
                 for left, right, action, index in zones.get(absolute, []):
                     click_zones[(screen_row, left, right)] = (action, index)
                     if action == 'inline':
@@ -2893,7 +3290,7 @@ def render_screen():
                 label = f"{marker} {name}"
                 delete_label = ' Confirm? ' if session_delete_pending == item['id'] else ' x '
                 name_width = max(1, width - len(delete_label))
-                put(screen_row, start, label.ljust(name_width), name_width, SELECTED_STYLE if marker == '*' else WHITE)
+                put(screen_row, start, label.ljust(name_width), name_width, SELECTED_STYLE if marker == '*' else WHITE, search=True)
                 click_zones[(screen_row, start, start + name_width - 1)] = ('open', index)
                 if width > len(delete_label):
                     put(screen_row, start + name_width, delete_label, len(delete_label), LIGHT_ORANGE)
@@ -2947,6 +3344,14 @@ def handle_direct_action(action_type, index):
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, inline_focus, inline_control
     global conversation, session_history, current_input_buffer, input_cursor
     global sidebar_visible, git_panel, panels_menu, panels_query, session_delete_pending
+    global about_open
+    if about_open:
+        if action_type == 'about_close':
+            about_open = False
+        return
+    if action_type == 'about':
+        about_open = True
+        return
     if action_type == 'session_delete':
         if bookmark_store is None:
             status_message = 'Sessions unavailable; check the work folder and restart.'
@@ -2971,6 +3376,7 @@ def handle_direct_action(action_type, index):
             status_message = str(exc)
         return
     if action_type == 'panels':
+        main_search.active = False
         panels_menu = None if panels_menu is not None else 0
         panels_query = ''
         return
@@ -3164,17 +3570,29 @@ def visible_bookmarks():
 
 
 def cli_main():
-    global MODEL_NAME
-    parser = argparse.ArgumentParser(description='Local Ollama terminal assistant. No arguments opens the TUI.')
-    parser.add_argument('--doctor', action='store_true', help='Check Ollama and machine environment')
+    global MODEL_NAME, ACTIVE_PROVIDER
+    parser = argparse.ArgumentParser(description='Terminal assistant for Ollama and compatible APIs. No arguments opens the TUI.')
+    parser.add_argument('--doctor', action='store_true', help='Check model configuration and machine environment')
     parser.add_argument('--model', help='Override the saved model for this invocation')
+    parser.add_argument('--provider', help='Use a saved API profile ID or name, or ollama')
     parser.add_argument('prompt', nargs='*')
     args = parser.parse_args()
     load_model_settings()
+    profile = selected_profile()
+    if args.provider:
+        profile = (next((dict(p) for p in MODEL_PROFILES if args.provider in (p['id'], p['label'])), None)
+                   if args.provider != 'ollama' else None)
+        if args.provider != 'ollama' and profile is None:
+            parser.error('Unknown API profile. Configure one in /models first.')
+        MODEL_NAME = profile['model'] if profile else OLLAMA_MODEL
     if args.model:
         MODEL_NAME = args.model
+    if profile:
+        profile['model'] = MODEL_NAME
     if args.doctor:
-        print(diagnostics(EXECUTION_SHELL, MODEL_NAME, OLLAMA_URL))
+        if args.provider:
+            ACTIVE_PROVIDER = profile['id'] if profile else ''
+        print(model_diagnostics())
         return 0
     prompt = ' '.join(args.prompt)
     if not sys.stdin.isatty():
@@ -3189,7 +3607,7 @@ def cli_main():
         parser.print_help()
         return 0
     token = uuid4().hex
-    _query_ollama([dict(role='user', content=prompt)], token, MODEL_NAME, [], str(Path.cwd()), None)
+    query_model_worker([dict(role='user', content=prompt)], token, MODEL_NAME, [], str(Path.cwd()), None, profile)
     while not print_queue.empty():
         status, _, text = print_queue.get()
         if status == 'SUCCESS':
@@ -3204,6 +3622,7 @@ def cli_main():
 def main():
     global current_input_buffer, input_cursor, follow_output, active_pane, mouse_selection, mouse_press, inline_focus
     global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover, panels_menu, panels_query
+    global about_open
     
     if len(sys.argv) > 1 or not sys.stdin.isatty() or not sys.stdout.isatty():
         try:
@@ -3223,6 +3642,7 @@ def main():
         sys.stdout.flush()
         redraw_screen()
         last_size = None
+        about_mouse_release = False
         while True:
             updated = process_results()
             poll_live_inspectors()
@@ -3246,6 +3666,28 @@ def main():
                 continue
                 
             event, value = read_input_event(fd)
+            if event == 'eof':
+                break
+            if about_mouse_release and event in ('drag', 'release'):
+                if event == 'release':
+                    about_mouse_release = False
+                continue
+            if event == 'click':
+                about_mouse_release = False
+            if about_open:
+                if event == 'escape' or event == 'key' and value in ('\r', '\n', '\x03'):
+                    handle_direct_action('about_close', 0)
+                elif event == 'click':
+                    hit = next((action for (row, left, right), action in click_zones.items()
+                                if row == value[1] and left <= value[0] <= right
+                                and action[0] == 'about_close'), None)
+                    if hit:
+                        handle_direct_action(*hit)
+                        about_mouse_release = True
+                else:
+                    continue
+                redraw_screen()
+                continue
             if event == 'hover':
                 previous = hover_region(mouse_hover)
                 mouse_hover = value
@@ -3254,10 +3696,12 @@ def main():
                 continue
             if event not in ('click', 'drag', 'release', 'right_click', 'ignore'):
                 mouse_selection, mouse_press = None, None
-            if event == 'eof':
-                break
             if event == 'key' and value == '\x0b':
                 handle_direct_action('panels', 0)
+                redraw_screen()
+                continue
+            if main_search.active:
+                main_search.event(event, value)
                 redraw_screen()
                 continue
             if event == 'click' and value[1] == 1:
@@ -3278,7 +3722,7 @@ def main():
                     panels_menu = choices[(position + step) % len(choices)]
                 elif choices and event == 'key' and value == '\r':
                     choose_panel(panels_menu)
-                elif event == 'key' and value in '12345678':
+                elif event == 'key' and value in '123456789'[:len(PANEL_ITEMS)]:
                     choose_panel(int(value)-1)
                 elif event == 'key' and value in ('\x7f', '\x08'):
                     panels_query = panels_query[:-1]
@@ -3295,6 +3739,10 @@ def main():
                         choose_panel(hit[1])
                     else:
                         panels_menu = None
+                redraw_screen()
+                continue
+            if git_panel is None and (event == 'find' or event == 'key' and value == '\x06'):
+                open_main_search()
                 redraw_screen()
                 continue
             if git_panel is not None:
@@ -3323,6 +3771,10 @@ def main():
                         status_message = 'Watch evidence attached. Type a question to ask the AI.'
                 redraw_screen()
                 continue
+            if model_picker is not None:
+                handle_model_picker_event(event, value)
+                redraw_screen()
+                continue
             if event == 'key' and value == '\x03':
                 if conversation is not None and conversation.active:
                     stop_session(conversation)
@@ -3339,10 +3791,6 @@ def main():
                     current_input_buffer = (input_history_draft if input_history_index == len(input_history)
                                             else input_history[input_history_index])
                     input_cursor = len(current_input_buffer)
-                redraw_screen()
-                continue
-            if model_picker is not None:
-                handle_model_picker_event(event, value)
                 redraw_screen()
                 continue
             if browser is not None:
@@ -3449,6 +3897,8 @@ def main():
                 redraw_screen()
                 
     finally:
+        if isinstance(git_panel, ScratchpadPanel):
+            git_panel.save_position()
         if watch_engine is not None:
             try:
                 watch_engine.close()

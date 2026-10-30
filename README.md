@@ -1,10 +1,12 @@
 # Pry
 
-A local terminal assistant with interactive inspectors and Ollama-powered AI.
+A terminal assistant with interactive inspectors and AI powered by Ollama or
+OpenAI-compatible / Anthropic-compatible APIs.
 
 Run `python3 ai-tool.py` in a terminal to open the TUI. Requires Python 3.10+,
-macOS or Linux, and **Ollama running locally with a downloaded model**. Ollama
-provides the model runtime; installing this Python app alone is not sufficient.
+macOS or Linux, and either **Ollama running locally with a downloaded model** or
+an **OpenAI-compatible / Anthropic-compatible API endpoint**. For API setup,
+open `/models` and choose **Add API**; Ollama is not required for API models.
 
 ## Install and start Ollama
 
@@ -55,6 +57,58 @@ The app connects to `http://localhost:11434`; no API key or cloud account is
 needed for downloaded local models. Internet access is needed for installation
 and model downloads; inference can then run offline. Use local model tags below
 rather than `:cloud` tags to keep inference on your machine.
+
+## Compatible API models
+
+Open `/models`, press `a` (or click **Add API**), and configure:
+
+- **Profile name:** a display name for this endpoint/model combination.
+- **Protocol:** OpenAI or Anthropic; press Space to toggle.
+- **API base URL:** include the version prefix, for example
+  `https://api.openai.com/v1` or `https://api.anthropic.com/v1`. The app appends
+  `/chat/completions` or `/messages`, respectively. Custom compatible endpoints
+  work too; HTTPS is required except for loopback HTTP endpoints.
+- **Model ID:** the exact model identifier supplied by your provider. This is
+  entered manually, so providers do not need to implement model discovery.
+- **API key environment variable:** the variable name, such as `OPENAI_API_KEY`
+  or `ANTHROPIC_API_KEY`, not the secret itself. Leave blank for endpoints that
+  do not require authentication.
+
+Set the key in the shell that launches the app, for example:
+
+```sh
+export OPENAI_API_KEY='your-api-key'
+python3 ai-tool.py
+```
+
+Use Tab / Shift-Tab to move fields, Backspace to edit, Ctrl-U to clear a field,
+Enter to save and select, and Esc to cancel. Saved API profiles appear alongside
+Ollama models even when Ollama is offline. Press `e` to edit the highlighted API
+profile or `d` to remove it (select another model before removing the active one).
+Create multiple profiles to use different models at the same endpoint.
+
+Profiles and the active selection persist in `~/.ai-tool/settings.json` (or
+`$AI_TOOL_WORKDIR/settings.json`). Keys are read from the environment at request
+time and are not saved in settings. `/model <name>` selects an Ollama model;
+`/cfg-model` remains an Ollama-only build action.
+
+**Privacy:** choosing an API profile sends conversation history, machine details,
+terminal observations, documentation excerpts, and any attached file context to
+that endpoint. Only select providers you trust with this data. API usage may be
+billable. Remote models receive the app's terminal-focused system instructions;
+Ollama models retain their own Modelfile instructions.
+
+The saved selection is also used by the CLI. Override it for one invocation:
+
+```sh
+python3 ai-tool.py --provider 'My API profile' "Explain rsync --archive"
+python3 ai-tool.py --provider ollama --model linux-cmds-7b "Explain find -type f"
+```
+
+`--provider` accepts a saved profile name or ID, or `ollama`. `--model` overrides
+the model ID for the selected provider without changing saved settings. `/doctor`
+and `--doctor` report API configuration and whether its key variable is present;
+remote connectivity and model access are checked when sending a chat request.
 
 ## Recommended local models
 
@@ -161,6 +215,7 @@ opens a filterable workspace switcher with numbered shortcuts. Workspace tabs an
 actions use compact horizontal strips; overflow arrows reveal additional choices,
 and Left/Right moves between actions. Forms support clickable fields and reverse
 navigation with Shift+Tab. Inspectors keep secondary actions under **More...**.
+The header's **About** button describes Pry and displays `(c) Paul Adams`.
 
 Assistant responses render Markdown headings, bold/italic text, inline code,
 links, lists, and quotes directly in the terminal, including while streaming.
@@ -168,6 +223,109 @@ Prose wraps at word boundaries with hanging indents for lists. Tables use aligne
 columns when they fit and switch to labelled fields in narrow panes. Fenced code
 keeps its existing command cards and actions once the response is complete.
 Copy Response preserves the original Markdown; terminal output stays literal.
+
+### Scratchpad journal
+
+Open **Panels > Scratchpad** or `/notes` for a persistent Markdown editor.
+All notes share `~/.ai-tool/notes.md` (or `$AI_TOOL_WORKDIR/notes.md`), beside
+`bookmarks.json`, independently of chat sessions. Each edit is saved atomically.
+Headings, emphasis, links, lists, and dividers render in place; the current line
+shows its Markdown source so you can edit it. Enter inserts a newline, arrows move
+the caret, Page Up/Down navigate, and the mouse wheel scrolls through the journal.
+Ctrl+Z undoes edits; Ctrl+Y redoes them. Esc clears a selection first, otherwise
+returns to chat without changing its draft. Ctrl+A selects all note text, not the
+terminal interface. Drag to select text, or use Shift+arrows, Shift+Home/End, and
+Shift+Page Up/Down; Ctrl+Home/End moves to the document boundaries, with Shift
+extending the selection. Ctrl+C copies, Ctrl+X cuts, and Ctrl+V pastes from
+the system clipboard. Your terminal's usual paste shortcut also works. Ctrl+Click
+an HTTP(S) URL or Markdown link to open it in your default browser, provided your
+terminal forwards modified mouse clicks to Pry.
+
+Typing or pasting replaces the editor selection; Backspace/Delete removes it.
+Copy and cut never select or copy the header, graph previews, or other panels.
+Pry requests extended keyboard reporting and recognizes forwarded Cmd+A/C/X/V/Z,
+Cmd+Shift+Z (redo), and Cmd+arrow navigation. Terminal menu shortcuts may still
+intercept Cmd keys before Pry receives them. If Cmd+A selects the terminal screen,
+use Ctrl+A or configure a terminal key mapping to send hexadecimal `01` for Cmd+A.
+Equivalent mappings are `03` for copy, `18` for cut, `16` for paste, `1a` for undo,
+and `19` for redo. These clipboard/selection mappings are intended for Notes;
+Ctrl+C retains its cancel/exit behavior elsewhere in Pry.
+
+The scratchpad remembers its caret and scroll position when you close it, switch
+workspaces, or quit Pry. Reopening it, including after a restart, restores both.
+This UI state lives in `~/.ai-tool/pry-state.json` (or
+`$AI_TOOL_WORKDIR/pry-state.json`), separate from the Markdown notes.
+
+Type `/new` on its own line and press Enter to insert a divider below the previous
+note, a **New Note** heading, and a local start timestamp. The title is selected;
+type to replace it, then press Enter to continue writing below the date.
+
+**Ctrl+F** opens a floating, Spotlight-style search box. Matches are literal and
+case-insensitive; typing jumps to a match, Enter/Down advances, and Up/Shift+Tab
+goes back, wrapping at either end. Esc returns to editing at the current hit.
+Search hits are highlighted in pink. The same search is available in chat,
+saved sessions, Files, Models, and the Git, Network, Services, and Watches panels.
+It searches the current view's text and lists, including panel output, without
+opening results or executing actions. Chat search covers rendered content;
+expand collapsed output first to search those hidden lines.
+Cmd+F also works when your terminal forwards it using the extended keyboard
+protocol; otherwise bind Cmd+F to send Ctrl+F (`0x06`) in your terminal settings.
+If saving fails or the file changes externally, Pry retains your draft, shows an
+error, and prevents closing/switching away rather than silently losing notes.
+Ctrl+S retries saving after a transient filesystem error.
+
+### Interactive note graphs
+
+In `/notes`, type `/graph` on its own line and press Enter. Pry inserts a complete
+example into `notes.md` and opens an interactive Braille graph with two curves:
+
+```graph
+xaxis=[0..1]
+t=[0..1]
+t=0
+amp=[-2..2]
+amp=0
+a=sin(2*pi*(xaxis-t))+amp
+x=a
+x=cos(2*pi*(xaxis-t))+amp
+axisy=[-3..3]
+plot(x,xaxis,t,amp)
+```
+
+Graph blocks are ordinary fenced Markdown using the `graph` language tag. Each
+closed block displays an inline preview beneath its source. Click a preview to
+expand it, or put the caret inside its source and press Ctrl+G. In the graph view,
+Tab/Shift+Tab or Up/Down selects a slider; Left/Right changes it by 1% of its range,
+and Home/End selects a bound. Click or drag a slider track to set its value.
+Esc returns to notes; `e` returns to editing the graph's expressions.
+
+`plot(output,sweep,parameters...)` sweeps the horizontal variable across its
+declared range. Its slider moves a playhead, with corresponding curve values
+shown below the graph. Other sliders reshape the curves. Ranged dependencies
+are inferred as sliders even if omitted from the plot's argument list. In the
+example, `xaxis` is the independent horizontal variable, `t` shifts the curves
+horizontally, and `amp` shifts them vertically. The `xaxis` slider moves only the
+playhead. Changing `xaxis=[lo..hi]` changes the plotted horizontal range.
+Optionally add `axisx=[lo..hi]` to override the visible horizontal bounds; when
+present it takes precedence over the sweep range. Remove that override if you
+want the graph to follow the `xaxis` range directly.
+Repeated output assignments create separate colored curves. Each plot uses the
+formulas and axis bounds preceding it; dependencies use the last definition in
+that snapshot. Add more `plot(...)` statements for additional previews; `[` and
+`]` switch plots in the expanded view. Slider values persist in `pry-state.json`,
+keyed by block contents, so editing a block resets its controls to its defaults.
+
+Use `[lo..hi]` to declare ranges, and a subsequent constant assignment to set a
+slider's initial value (otherwise it starts at the midpoint). `axisx` overrides
+the horizontal bounds; `axisy` sets vertical bounds. Without `axisx`, the sweep
+range is used; without `axisy`, vertical bounds are calculated automatically.
+Arithmetic supports `+ - * / % **` and `^` for powers, parentheses, `pi`, `e`,
+`tau`, and functions including `sin`, `cos`, `tan`, `sqrt`, `log`, `exp`, `abs`,
+`min`, and `max`. Statements can be on separate lines or separated by semicolons;
+`#` starts a comment. Invalid expressions show a line-specific error. Domain
+errors produce gaps. Evaluation is bounded and does not execute Python code.
+Braille provides 2-by-4 drawing dots per terminal cell; use a Unicode-capable
+fixed-width font. No graphics protocol or third-party dependency is needed.
 
 Use **Ctrl+B** or `/sidebar` to toggle the saved
 session sidebar. The preference persists across launches, and toggling preserves

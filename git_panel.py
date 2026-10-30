@@ -3,8 +3,10 @@ import queue
 import re
 import threading
 import unicodedata
+from functools import wraps
 from typing import Any
 from git_workspace import Repository
+from spotlight_search import SpotlightSearch
 from tui_theme import PANEL, BORDER, SUCCESS, WARNING, ERROR, BUTTON, FOCUSED_BUTTON
 
 
@@ -28,17 +30,24 @@ def field_tail(value, width):
     return '<' + value[start:]
 
 
-def diff_rows(patch, width, wrap, styles):
+def diff_rows(patch, width, wrap, styles, line_rows=None):
     """Render unified patches without altering the underlying operation output."""
     base, muted, text, accent, _ = styles
     added, removed = SUCCESS, ERROR
     lines = patch.splitlines()
     if not any(line.startswith('diff --git ') for line in lines):
-        return [row for line in lines for row in wrap(base + text + visible(line), width)]
+        result = []
+        for number, line in enumerate(lines):
+            if line_rows is not None:
+                line_rows[number] = len(result)
+            result.extend(wrap(base + text + visible(line), width))
+        return result
     records = []
+    sources = []
     old = new = None
     additions = deletions = files = 0
-    for line in lines:
+    for number, line in enumerate(lines):
+        record_start = len(records)
         if line.startswith('diff --git '):
             files += 1
             old = new = None
@@ -62,6 +71,7 @@ def diff_rows(patch, width, wrap, styles):
             deletions += marker == '-'
         else:
             records.append((line, muted, '', ''))
+        sources.extend([number] * (len(records) - record_start))
     digits = max(3, max((len(number) for _, _, before, after in records for number in (before, after)), default=0))
     gutter_width = 2 * digits + 3
     show_gutter = width >= gutter_width + 12
@@ -69,7 +79,9 @@ def diff_rows(patch, width, wrap, styles):
     for line in (f'{files} file(s) | +{additions} added | -{deletions} removed',
                  'Old / New lines | + added | - removed', ''):
         result.extend(wrap(base + accent + line, width))
-    for content, color, before, after in records:
+    for source, (content, color, before, after) in zip(sources, records):
+        if line_rows is not None and source not in line_rows:
+            line_rows[source] = len(result) + (1 if content == '' and lines[source].startswith('diff --git ') else 0)
         numbered = bool(before or after)
         prefix = f'{before:>{digits}} {after:>{digits}} | ' if numbered and show_gutter else ''
         chunks = wrap(base + color + visible(content).expandtabs(4), max(1, width - len(prefix)))
@@ -80,6 +92,19 @@ def diff_rows(patch, width, wrap, styles):
 
 
 class GitPanel:
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        handler = cls.__dict__.get('event')
+        if handler is not None:
+            # Derived panels intercept shortcuts before calling super(). Search
+            # must own input first, without changing each panel's public API.
+            @wraps(handler)
+            def event(self, event, value):
+                if self._search_event(event, value):
+                    return None
+                return handler(self, event, value)
+            cls.event = event
+
     list_title = 'Files / branches / stashes'
     output_title = 'Diff / operation output'
     footer = 's stage · u unstage · c commit · r refresh · Esc close · Ctrl+C cancel job'
@@ -115,6 +140,8 @@ class GitPanel:
         self.zones: list[tuple[int, int, int, str, Any]] = []
         self.output_rows = 0
         self.output_is_diff = False
+        self.search = SpotlightSearch(on_jump=self._search_jump)
+        self._search_output_line = None
         if auto_refresh:
             self.start('refresh')
 
@@ -255,7 +282,39 @@ class GitPanel:
             self.form = dict(action=action, fields=fields, index=0, value=value, entry=entry, summary=summary)
         return None
 
+    def _search_jump(self, target):
+        kind, number = target
+        if kind == 'entry':
+            self.index = self.top = number
+            self.focus = 'list'
+            self._search_output_line = None
+        else:
+            self.focus = 'output'
+            if hasattr(self, 'output_visible'):
+                self.output_visible = True
+            self._search_output_line = number
+            self.offset = getattr(self, '_output_line_rows', {}).get(number, 0)
+
+    def _search_event(self, event, value):
+        if self.search.active:
+            return self.search.event(event, value)
+        if event == 'find' or event == 'key' and value == '\x06':
+            # Do not obscure an editing form or its specialized picker.
+            if not self.form and not getattr(self, 'picker', None):
+                entries = self.entries()
+                candidates = [(entry['label'], ('entry', i)) for i, entry in enumerate(entries)]
+                candidates += [(line, ('output', i)) for i, line in enumerate(self.output.splitlines())]
+                current = self.index
+                if self.focus == 'output':
+                    mapping = getattr(self, '_output_line_rows', {})
+                    current = len(entries) + next((i for i, row in mapping.items() if row >= self.offset), 0)
+                self.search.open(candidates, current=current)
+            return True
+        return False
+
     def event(self, event, value):
+        if self._search_event(event, value):
+            return None
         if event == 'key' and value == '\x03':
             if self.busy:
                 self.cancel.set()
@@ -351,7 +410,7 @@ class GitPanel:
             if 1 <= row <= rows and 1 <= col <= cols and width > 0:
                 width = min(width, cols-col+1)
                 output.append(f'\033[{row + top};{col}H' + base + style + ' ' * width)
-                output.append(f'\033[{row + top};{col}H' + wrap(base + style + visible(value), width)[0])
+                output.append(f'\033[{row + top};{col}H' + self.search.highlight(wrap(base + style + visible(value), width)[0]))
 
         def strip(items, current, row, kind):
             # Keep the selected item in a one-line window, even on small terminals.
@@ -426,19 +485,25 @@ class GitPanel:
         output_height = max(0, rows-out_row-2) if output_visible else 0
         # Wrap before scrolling so very long lines remain accessible.
         physical = []
+        self._output_line_rows = {}
         if self.output_is_diff:
-            physical = diff_rows(self.output, max(1,cols-out_col+1), wrap, styles)
+            physical = diff_rows(self.output, max(1,cols-out_col+1), wrap, styles, self._output_line_rows)
         else:
-            for line in self.output.splitlines():
+            for number, line in enumerate(self.output.splitlines()):
+                self._output_line_rows[number] = len(physical)
                 physical.extend(wrap(text + visible(line), max(1,cols-out_col+1)))
         self.output_rows = len(physical)
+        if self._search_output_line is not None:
+            self.offset = self._output_line_rows.get(self._search_output_line, 0)
+            if not self.search.active:
+                self._search_output_line = None
         self.offset = min(self.offset,max(0,len(physical)-output_height))
         if output_visible:
             for row in range(out_row-1, out_row+output_height):
                 self.zones.append((row,out_col,cols,'output_focus',None))
         for n,line in enumerate(physical[self.offset:self.offset+output_height]):
             if out_row+n < rows-2:
-                output.append(f'\033[{out_row+n+top};{out_col}H'+base+line)
+                output.append(f'\033[{out_row+n+top};{out_col}H'+base+self.search.highlight(line))
         hint = self.hints.get(actions[self.action_index][1], '') if self.focus == 'actions' else ''
         context = (f'Action {self.action_index+1}/{len(actions)}: {actions[self.action_index][0]} | Left/Right choose | Enter apply' if self.focus == 'actions' else
                    f'Output {min(self.offset+1, len(physical))}-{min(len(physical), self.offset+output_height)}/{len(physical)} | wheel / PgUp / PgDn scroll' if self.focus == 'output' else
@@ -480,4 +545,9 @@ class GitPanel:
                       for row, left, right, action, argument in self.zones
                       if 1 <= row <= rows and 1 <= left <= right <= cols]
         output.append('\033[?25l')
+        overlay = self.search.draw(cols, rows, wrap, styles)
+        if top:
+            overlay = re.sub(r'\033\[(\d+);(\d+)H',
+                             lambda match: f'\033[{int(match[1]) + top};{match[2]}H', overlay)
+        output.append(overlay)
         return ''.join(output)
