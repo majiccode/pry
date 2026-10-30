@@ -33,6 +33,9 @@ from recipes import RecipeStore
 from context_budget import build_messages
 from git_panel import GitPanel
 from network_panel import NetworkPanel
+from services_panel import ServicesPanel
+from watches import WatchEngine
+from watches_panel import WatchesPanel
 from response_rendering import render_markdown
 from file_preview import render_file_preview
 import investigation
@@ -53,6 +56,12 @@ input_history_draft = ''
 session_filter = ''
 sidebar_visible = True
 git_panel = None
+watch_engine = None
+panels_menu = None
+session_delete_pending = None
+PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
+               ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
+               ('Models', '/models'), ('Sessions', '/bookmarks')]
 BLACK_BG = '\033[49m'
 ORANGE = '\033[38;5;109m'
 CYAN = '\033[38;5;109m'
@@ -415,6 +424,9 @@ COMMANDS = [('/new', 'Start a new conversation'),
             ('/cfg-model', 'Edit Modelfile and build: /cfg-model <name>'),
             ('/exit', 'Exit the app (alias)')]
 COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>'),
+             ('/panels', 'Choose a workspace from the Panels menu'),
+             ('/watch', 'Configure port, process, disk and log watches'),
+             ('/services', 'Browse services and prepare start/stop commands'),
              ('/investigate', 'Guided TCP diagnosis: host:port | next | conclude | off'),
              ('/inspect', 'Show active inspector context; /inspect off detaches it'),
              ('/git', 'Open Git workspace for the current folder: /git [status]'),
@@ -613,7 +625,7 @@ def scroll_view(amount):
 
 
 def initialize_app():
-    global bookmark_store, status_message, recipe_store
+    global bookmark_store, status_message, recipe_store, watch_engine
     sessions.clear()
     workdir = Path(os.environ.get('AI_TOOL_WORKDIR', '~/.ai-tool')).expanduser()
     try:
@@ -631,6 +643,10 @@ def initialize_app():
         recipe_store = RecipeStore(workdir / 'recipes.json')
     except (OSError, ValueError, TypeError) as exc:
         status_message = f'Recipes unavailable: {exc}'
+    try:
+        watch_engine = WatchEngine(workdir / 'watches.json')
+    except (OSError, ValueError, TypeError) as exc:
+        status_message = f'Watches unavailable: {exc}'
     threading.Thread(target=lambda: print_queue.put(('STARTUP', '', diagnostics(EXECUTION_SHELL, MODEL_NAME, OLLAMA_URL))),
                      daemon=True).start()
 
@@ -791,7 +807,7 @@ def refresh_browser():
 
 
 def browser_action(action):
-    global browser, status_message, current_input_buffer, input_cursor
+    global browser, status_message, current_input_buffer, input_cursor, git_panel
     assert browser is not None and conversation is not None
     if action == 'add':
         conversation.paths = sorted(browser['selected'])
@@ -808,7 +824,14 @@ def browser_action(action):
         refresh_browser()
     elif browser['entries']:
         path = browser['entries'][browser['index']]
-        if action == 'extract' and inspector_registry.is_archive(path) and not path.is_symlink():
+        if action == 'watch':
+            if watch_engine is None:
+                browser['message'] = 'Watches unavailable; check the work directory and restart.'
+            else:
+                git_panel = WatchesPanel(conversation.cwd, watch_engine,
+                                        prefill=dict(kind='disk' if path.is_dir() else 'log', path=str(path)))
+                browser = None
+        elif action == 'extract' and inspector_registry.is_archive(path) and not path.is_symlink():
             current_input_buffer = '/cmd ' + shlex.join([sys.executable, str(Path(__file__).with_name('archive_extract.py')), str(path)]) + ' {{destination}}'
             input_cursor = len(current_input_buffer)
             browser = None
@@ -867,7 +890,7 @@ def handle_browser_event(event, value):
             browser['index'] += amount * (10 if event == 'page' else 1)
         browser['index'] = max(0, min(len(browser['entries']) - 1, browser['index']))
     elif event == 'key':
-        actions = {'\r': 'open', ' ': 'select', '\x7f': 'up', '\x08': 'up', 'a': 'add', 'u': 'cwd', 'x': 'extract'}
+        actions = {'\r': 'open', ' ': 'select', '\x7f': 'up', '\x08': 'up', 'a': 'add', 'u': 'cwd', 'x': 'extract', 'w': 'watch'}
         if value == 'g':
             browser['path_input'] = ''
         elif value in actions:
@@ -1028,7 +1051,7 @@ def handle_completion_event(event, value):
 def handle_submission(text):
     """Handle local commands, returning False when the app should exit."""
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, current_input_buffer
-    global EXECUTION_SHELL, COMMAND_TIMEOUT, session_filter, git_panel
+    global EXECUTION_SHELL, COMMAND_TIMEOUT, session_filter, git_panel, panels_menu
     command = text.lower()
     if conversation is None and not command.startswith(('/quit', '/exit')):
         new_session()
@@ -1040,7 +1063,15 @@ def handle_submission(text):
     if verb in {entry[0] for entry in COMMANDS[11:]}:
         try:
             assert conversation is not None
-            if verb == '/investigate':
+            if verb == '/panels':
+                panels_menu = 0
+            elif verb == '/watch':
+                if watch_engine is None:
+                    raise ValueError('Watches unavailable; check the work directory and restart.')
+                git_panel = WatchesPanel(conversation.cwd, watch_engine)
+            elif verb == '/services':
+                git_panel = ServicesPanel(conversation.cwd)
+            elif verb == '/investigate':
                 investigate_command(argument)
             elif verb == '/network':
                 git_panel = NetworkPanel(conversation.cwd, argument)
@@ -1942,9 +1973,52 @@ def inspector_attachment_label(session):
 
 
 def inline_action(item, action, argument=None):
-    global status_message, follow_output, current_input_buffer, input_cursor, inline_focus
+    global status_message, follow_output, current_input_buffer, input_cursor, inline_focus, git_panel
     view = item.setdefault('_inline', dict(stack=[], page=item['interactive'], offset=0, collapsed=False))
     page = view['page']
+    if action == 'watch':
+        if watch_engine is None:
+            status_message = 'Watches unavailable; check the work directory and restart.'
+            return
+        content = view.get('content', [])
+        cursor = view.get('cursor', 0)
+        selected = content[cursor] if content and cursor < len(content) else None
+        target = (selected[1] if selected and selected[1] else view.get('target')) or {}
+        path = target.get('path') or page.get('attach')
+        label = selected[0] if selected else ''
+        port = re.search(r'(\[[^\]]+\]|[\w.*-]+):(\d+)\b', ANSI_STYLE.sub('', label))
+        if page.get('title', '').startswith('Ports'):
+            config = dict(kind='port')
+            if port:
+                host = port[1].strip('[]')
+                config.update(host='localhost' if host in ('*', '0.0.0.0', '::') else host, port=int(port[2]))
+        elif target.get('kind') == 'process':
+            config = dict(kind='process', pid=target['pid'])
+        elif path:
+            path = Path(path).expanduser()
+            if not path.is_absolute():
+                path = Path(item.get('cwd', conversation.cwd)) / path
+            config = dict(kind='disk' if path.is_dir() else 'log', path=str(path))
+        elif page.get('log'):
+            args = shlex.split(item['prompt'])
+            candidates = []
+            if args and Path(args[0]).name == 'tail':
+                for arg in args[1:]:
+                    candidate = Path(arg).expanduser()
+                    if not candidate.is_absolute():
+                        candidate = Path(item.get('cwd', conversation.cwd)) / candidate
+                    if not arg.startswith('-') and candidate.is_file():
+                        candidates.append(candidate)
+            if len(candidates) != 1:
+                status_message = 'Choose a local log file in Panels > Watches > Logs; this output has no single file source.'
+                return
+            config = dict(kind='log', path=str(candidates[0]))
+        else:
+            status_message = 'Open Panels > Watches to choose a condition for this observation.'
+            return
+        git_panel = WatchesPanel(conversation.cwd, watch_engine, prefill=config)
+        inline_focus = None
+        return
     if conversation is not None:
         conversation.inspector_token = item.get('token')
     if action == 'ask_ai':
@@ -2304,6 +2378,7 @@ def build_transcript(history, width, saved=False):
         if conversation is not None and getattr(conversation, 'inspector_token', None) == item.get('token'):
             add('Attached to AI prompt', CYAN)
         control('Ask AI about this', 'ask_ai')
+        control('Watch This', 'watch')
         if view['stack']:
             control('Back', 'back')
         control('Refresh', 'refresh')
@@ -2495,13 +2570,15 @@ def draw_file_browser(cols, rows):
             label += f' (unavailable: {reason})'
         put(offset + 3, label, GREY if reason else CYAN)
         click_zones[(offset + 4, 1, cols)] = ('browser_entry', index)
-    put(rows - 3, BUTTON_STYLE + ' Add Selected (a) ' + BASE_STYLE)
+    put(rows - 3, BUTTON_STYLE + ' Add Selected (a)  Watch This (w) ' + BASE_STYLE)
     put(rows - 2, BUTTON_STYLE + ' Use Directory (u) ' + BASE_STYLE)
     if rows >= 6:
         click_zones[(rows - 2, 1, min(cols, len(' Add Selected (a) ')))] = ('add', 0)
+        if cols >= 32:
+            click_zones[(rows - 2, 18, 32)] = ('watch', 0)
         click_zones[(rows - 1, 1, min(cols, len(' Use Directory (u) ')))] = ('cwd', 0)
     put(rows - 1, browser['message'])
-    put(rows, 'Go to: ' + browser['path_input'] if browser['path_input'] is not None else 'Up/Down: move | Enter: open | Space: select | Backspace: up | g: path | Esc: close', WHITE)
+    put(rows, 'Go to: ' + browser['path_input'] if browser['path_input'] is not None else 'Up/Down: move | Enter: open | Space: select | w: watch | Backspace: up | g: path | Esc: close', WHITE)
     sys.stdout.flush()
 
 
@@ -2510,6 +2587,8 @@ def redraw_screen():
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         render_screen()
+        if panels_menu is not None:
+            draw_panels_menu()
     frame = output.getvalue()
     sys.stdout.write('\033[?2026h' + frame + hover_overlay(frame) + '\033[?2026l')
     sys.stdout.flush()
@@ -2520,12 +2599,26 @@ def hover_region(position):
         return None
     x, y = position
     zones = ([(row, left, right, (action, argument)) for row, left, right, action, argument in git_panel.zones]
-             if git_panel is not None else [(row, left, right, action) for (row, left, right), action in click_zones.items()])
+             if git_panel is not None else [])
+    zones += [(row, left, right, action) for (row, left, right), action in click_zones.items()
+              if git_panel is None or row == 1 or action[0] == 'panel_choice']
     hit = next(((row, left, right, action) for row, left, right, action in zones
                 if row == y and left <= x <= right), None)
     if hit is None:
         return None
     row, left, right, action = hit
+    if git_panel is not None and action[0] == 'entry':
+        entries = git_panel.entries()
+        if not 0 <= action[1] < len(entries):
+            return None
+        label = '  ' + str(entries[action[1]]['label'])
+        label = ''.join(c if c == '\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in label)
+        width = sum(end - start + 1 for _, start, end in text_cells(label))
+        right = min(right - 1, left + width - 1)
+        return (row, left, right) if left <= x <= right else None
+    if action[0] == 'panel_choice':
+        right = min(right, left + len(PANEL_ITEMS[action[1]][0]) + 1)
+        return (row, left, right) if left <= x <= right else None
     if git_panel is None and action[0] == 'inline':
         _, operation, argument = action[1]
         if operation == 'focus':
@@ -2590,11 +2683,7 @@ def draw_pry_header(cols, controls=False):
         sys.stdout.write(f'\033[1;{col}H' + wrap_terminal_line(BASE_STYLE + color + text, width)[0])
 
     put(1, ' ' * cols, cols)
-    actions = [('Git', 'git'), ('Network', 'network'), ('Sessions', 'sidebar'), ('Files', 'files'), ('Delete', 'delete')]
-    if cols < sum(len(label) + 3 for label, _ in actions) + 25:
-        actions = [('Sessions', 'sidebar'), ('Files', 'files')]
-    if not controls or cols < 40:
-        actions = []
+    actions = [('Panels', 'panels')] if cols >= 16 else []
     right = cols + 1
     for label, action in reversed(actions):
         text = f' {label} '
@@ -2610,7 +2699,38 @@ def draw_pry_header(cols, controls=False):
     activity = 'Working' if busy else 'Ready'
     if conversation and conversation.investigation:
         activity += ' / Investigating'
-    put(1, f'Pry | {MODEL_NAME} | {activity} | {directory}', max(1, right - 1))
+    watching = ''
+    if watch_engine:
+        running = sum(item['status'] == 'running' for item in watch_engine.items)
+        triggered = sum(bool(item['events']) for item in watch_engine.items)
+        if running or triggered:
+            watching = f' | Watches: {running} / Alerts: {triggered}'
+    put(1, f'Pry{watching} | {MODEL_NAME} | {activity} | {directory}', max(1, right - 1))
+
+
+def draw_panels_menu():
+    try:
+        cols, rows = os.get_terminal_size()
+    except OSError:
+        cols, rows = 80, 24
+    width = min(22, cols)
+    left = max(1, cols - width + 1)
+    for index, (label, _) in enumerate(PANEL_ITEMS[:max(0, rows - 1)]):
+        style = SELECTED_STYLE if index == panels_menu else BASE_STYLE + WHITE
+        text = f' {label} '.ljust(width)
+        sys.stdout.write(f'\033[{index+2};{left}H' + wrap_terminal_line(style + text, width)[0])
+        click_zones[(index+2, left, cols)] = ('panel_choice', index)
+
+
+def choose_panel(index):
+    global panels_menu, git_panel, browser, model_picker, status_message
+    panels_menu = None
+    if git_panel is not None and git_panel.busy:
+        status_message = 'Wait for the panel operation or cancel it before switching panels.'
+        git_panel.message = status_message
+        return
+    git_panel, browser, model_picker = None, None, None
+    handle_submission(PANEL_ITEMS[index][1])
 
 
 def render_screen():
@@ -2714,8 +2834,13 @@ def render_screen():
                 marker = '*' if conversation and item['id'] == conversation.session_id else ' '
                 name = ' '.join((item.get('name') or item['prompt']).split())
                 label = f"{marker}{index + 1}. {name} ({len(item['history'])} turns)"
-                put(screen_row, start, label, width, SELECTED_STYLE if marker == '*' else GREY)
-                click_zones[(screen_row, start, start + width - 1)] = ('open', index)
+                delete_label = ' Confirm? ' if session_delete_pending == item['id'] else ' Delete '
+                name_width = max(1, width - len(delete_label))
+                put(screen_row, start, label, name_width, SELECTED_STYLE if marker == '*' else GREY)
+                click_zones[(screen_row, start, start + name_width - 1)] = ('open', index)
+                if width > len(delete_label):
+                    put(screen_row, start + name_width, delete_label, len(delete_label), LIGHT_ORANGE)
+                    click_zones[(screen_row, start + name_width, start + width - 1)] = ('session_delete', item['id'])
             elif not saved_items and offset == 0:
                 put(screen_row, start, 'No saved conversations', width)
     if rows >= 4:
@@ -2759,7 +2884,36 @@ def handle_direct_action(action_type, index):
     """Open saved transcripts or act on a command in the visible transcript."""
     global selected_bookmark, active_pane, scroll_top_index, follow_output, status_message, inline_focus, inline_control
     global conversation, session_history, current_input_buffer, input_cursor
-    global sidebar_visible, git_panel
+    global sidebar_visible, git_panel, panels_menu, session_delete_pending
+    if action_type == 'session_delete':
+        if bookmark_store is None:
+            status_message = 'Sessions unavailable; check the work folder and restart.'
+            return
+        if session_delete_pending != index:
+            session_delete_pending = index
+            status_message = 'Click Confirm? beside this session to delete it. Opening a session cancels.'
+            return
+        try:
+            target = sessions.get(index)
+            if target:
+                stop_session(target)
+            bookmark_store.delete(index)
+            sessions.pop(index, None)
+            if conversation is not None and conversation.session_id == index:
+                conversation, session_history, selected_bookmark = None, [], None
+                inline_focus, inline_control = None, 'input'
+                scroll_top_index, follow_output = 0, True
+            session_delete_pending = None
+            status_message = 'Session deleted. Captured command log files are retained.'
+        except (OSError, ValueError) as exc:
+            status_message = str(exc)
+        return
+    if action_type == 'panels':
+        panels_menu = None if panels_menu is not None else 0
+        return
+    if action_type == 'panel_choice':
+        choose_panel(index)
+        return
     if action_type == 'investigate':
         handle_submission('/investigate' + (' ' + index if index else ''))
         return
@@ -2809,6 +2963,7 @@ def handle_direct_action(action_type, index):
             return
         try:
             if action_type == 'open':
+                session_delete_pending = None
                 saved_items = visible_bookmarks()
                 if not 0 <= index < len(saved_items):
                     return
@@ -2981,7 +3136,7 @@ def cli_main():
 
 def main():
     global current_input_buffer, input_cursor, follow_output, active_pane, mouse_selection, mouse_press, inline_focus
-    global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover
+    global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover, panels_menu
     
     if len(sys.argv) > 1 or not sys.stdin.isatty() or not sys.stdout.isatty():
         try:
@@ -3004,6 +3159,11 @@ def main():
         while True:
             updated = process_results()
             poll_live_inspectors()
+            if watch_engine is not None:
+                try:
+                    updated = watch_engine.poll() or updated
+                except (OSError, ValueError) as exc:
+                    status_message = f'Watch persistence error: {exc}'
             if git_panel is not None:
                 updated = git_panel.poll() or updated
             try:
@@ -3029,6 +3189,35 @@ def main():
                 mouse_selection, mouse_press = None, None
             if event == 'eof':
                 break
+            if event == 'click' and value[1] == 1:
+                hit = next((action for (row, left, right), action in click_zones.items()
+                            if row == 1 and left <= value[0] <= right), None)
+                if hit:
+                    handle_direct_action(*hit)
+                    redraw_screen()
+                    continue
+            if panels_menu is not None:
+                if event == 'escape' or event == 'key' and value == '\x03':
+                    panels_menu = None
+                elif event == 'scroll':
+                    panels_menu = (panels_menu + value) % len(PANEL_ITEMS)
+                elif event == 'wheel':
+                    panels_menu = (panels_menu + (1 if value[0] > 0 else -1)) % len(PANEL_ITEMS)
+                elif event == 'key' and value == '\t':
+                    panels_menu = (panels_menu + 1) % len(PANEL_ITEMS)
+                elif event == 'key' and value == '\r':
+                    choose_panel(panels_menu)
+                elif event == 'key' and value in '12345678':
+                    choose_panel(int(value)-1)
+                elif event == 'click':
+                    hit = next((action for (row, left, right), action in click_zones.items()
+                                if row == value[1] and left <= value[0] <= right and action[0] == 'panel_choice'), None)
+                    if hit:
+                        choose_panel(hit[1])
+                    else:
+                        panels_menu = None
+                redraw_screen()
+                continue
             if git_panel is not None:
                 result = git_panel.event(event, value)
                 if result:
@@ -3036,9 +3225,10 @@ def main():
                     git_panel = None
                     if action == 'explain' and conversation is not None:
                         conversation.submit(text)
-                    elif action == 'network_command':
+                    elif action in ('network_command', 'service_command'):
                         current_input_buffer = '/run ' + text
                         input_cursor = len(current_input_buffer)
+                        status_message = 'Command prepared only. Review it and press Enter to execute in the terminal.'
                     elif action == 'network_browse' and conversation is not None:
                         conversation.submit_command(shlex.join(['ls', '-la', text]))
                     elif action == 'network_explain' and conversation is not None:
@@ -3049,6 +3239,9 @@ def main():
                         conversation.inspector_token = item['token']
                         conversation.changed()
                         status_message = 'Network selection attached. Type your question about this connection.'
+                    elif action == 'watch_explain' and conversation is not None:
+                        add_local_result(conversation, '/watch observation', text)
+                        status_message = 'Watch evidence attached. Type a question to ask the AI.'
                 redraw_screen()
                 continue
             if event == 'key' and value == '\x03':
@@ -3177,6 +3370,11 @@ def main():
                 redraw_screen()
                 
     finally:
+        if watch_engine is not None:
+            try:
+                watch_engine.close()
+            except OSError:
+                pass
         if git_panel is not None:
             git_panel.cancel.set()
             if git_panel.thread is not None:

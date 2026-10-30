@@ -163,13 +163,17 @@ columns when they fit and switch to labelled fields in narrow panes. Fenced code
 keeps its existing command cards and actions once the response is complete.
 Copy Response preserves the original Markdown; terminal output stays literal.
 
-Use **Ctrl+B**, `/sidebar`, or the **Sessions** header control to toggle the saved
+Use **Ctrl+B** or `/sidebar` to toggle the saved
 session sidebar. The preference persists across launches, and toggling preserves
 your draft. Narrow terminals show sessions as a full-width list when focused.
 Long terminal output and local references initially show 12 lines; **Show all**
 expands them and **Collapse output** folds them again. Copy Response always copies
 the complete captured response. When scrolled up, the status bar shows how to
 return to following new output.
+
+Each saved session has a **Delete** control. Click it, then **Confirm?** on that
+same row to delete the session. Opening a session cancels the confirmation.
+Deleting a session does not remove its captured command log files.
 
 - `/cmd COMMAND`: stream stdout/stderr with a bounded 48 KiB tail in the UI.
 - `/run COMMAND`: hand the terminal to an interactive program, such as `top`,
@@ -259,7 +263,7 @@ Output, Next Diagnostic and Verify Result; these ask the model for suggestions.
 
 ## Git workspace
 
-Open **Git** in the header, or enter `/git` (`/git status` and `/git cmd` also
+Open **Panels > Git** in the header, or enter `/git` (`/git status` and `/git cmd` also
 open the panel). It finds the repository containing the conversation's current
 working directory, including when you are in a subfolder. Use `/cd PATH` first
 if necessary. Closing with Esc returns to your unchanged chat draft.
@@ -338,7 +342,69 @@ for new fields and interrupted commands are never rerun on restore.
 Clipboard uses pbcopy/pbpaste on macOS, wl-copy/wl-paste on Wayland, then xclip or
 xsel. Install the matching backend if unavailable.
 
-Verification: `python3 -B -m unittest discover` plus syntax and manual smoke checks.
+Verification uses syntax checks and manual smoke checks.
+
+## Panels menu
+
+The orange header has one **Panels** dropdown for Chat, Git, Network, Services,
+Watches, Files, Models, and Sessions. Click it from any screen, or type `/panels`
+in chat. Up/Down or Tab selects a destination; Enter opens it; Esc dismisses it.
+Switching panels preserves your chat draft. Finish or cancel an active panel job
+before switching. The header shows active-watch and alert counts when present.
+
+## Watches
+
+Open **Panels > Watches** or `/watch`. Choose Ports, Processes, Disk, or Files,
+then **Add Watch**. Forms configure host/port and reachable/unreachable, a PID
+exit, a filesystem usage threshold, or literal text in selected files. Process, filesystem,
+and file pickers avoid needing command syntax; use **Choose...** or Ctrl+O from
+the corresponding draft. Directly entered paths resolve against the session
+working directory and support `~`.
+
+Set the check interval, stop-after duration, and notify-once/repeat option. Space
+toggles condition and repeat fields; Tab moves between fields. **Apply** starts
+checks. Ports make TCP connections without application data; disk checks are
+read-only; process checks detect exit/PID reuse. File watches have no default
+filename: choose up to 32 files, toggle selections with Space/Enter, then choose
+**Use selected files** and Apply. A match in any chosen file triggers the watch,
+including text already present when it starts. Matching is literal and case-sensitive.
+The observation identifies the file and matching excerpt. Changed or replaced
+files are rescanned. An error is displayed, never treated as a match.
+Checks happen at the configured interval, not instantaneously. Each file scan
+advances by at most 64 KiB per check, so large files can take several checks.
+
+Watches continue while another panel is open. Inspect shows timestamped trigger
+evidence; Pause, Resume, Edit, and Remove require explicit confirmation. Repeat
+fires when a condition changes from not matched to matched, not every poll.
+Ask AI attaches evidence to chat for your next question, without sending it
+automatically. **Watch This** in relevant inspectors and `w` in the Files picker
+open a prefilled draft. Verify a prefilled port endpoint before applying.
+
+Definitions and bounded evidence are stored in `~/.ai-tool/watches.json` (or
+`$AI_TOOL_WORKDIR/watches.json`) with mode 0600. Saved watches always reopen
+paused; Resume resets their timeout and baseline. Up to 100 watches are allowed,
+with at most 20 trigger events each. File evidence can contain sensitive text.
+Polling is best effort, not a substitute for production monitoring; very short
+events between checks may be missed. Process identity starts at the first check.
+
+## Services
+
+Open **Panels > Services** or `/services` to browse service state and details.
+On macOS, tabs show current-user launchd jobs and Homebrew services. On Linux,
+tabs show loaded user/system systemd service units, including inactive units;
+this is not a list of every installed service file. Tools reports discovery
+failures, permissions, and missing managers.
+
+Select a service and Inspect it. Details appear below the full-width service
+list, not beside service names.
+Details are hidden initially; **Hide details** or Esc restores the full list.
+Start, Stop, and Restart actions **prepare a `/run` command in chat**, never
+execute it immediately.
+Review and press Enter; authentication stays in the terminal. Refresh Services
+after execution. Linux system actions use sudo; user and Homebrew actions do
+not. launchd actions require successful inspection of the current GUI job first;
+Stop sends SIGTERM, and KeepAlive may restart it automatically. System launchd
+management is deliberately not offered.
 
 ## Guided investigations
 
@@ -369,7 +435,7 @@ TLS, database health, or arbitrary machine failures.
 
 ## Network browser
 
-Open **Network** in the header or `/network`. Supports **SMB**, **NFS**, and
+Open **Panels > Network** in the header or `/network`. Supports **SMB**, **NFS**, and
 **SFTP/SSH** using installed system tools. Discovery progressively lists advertised
 services when you choose **Discover**; opening the panel does not start a scan.
 Server/share/mount results are retained when reopening it during the same app

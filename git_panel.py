@@ -331,7 +331,8 @@ class GitPanel:
                 put(3, col, label, len(label), selected if tab == self.tab else accent)
                 self.zones.append((3, col, col+len(label)-1, 'tab', tab))
                 col += len(label) + 1
-        wide = cols >= 85
+        output_visible = getattr(self, 'output_visible', True)
+        wide = cols >= 85 and not getattr(self, 'stacked_output', False) and output_visible
         left_width = min(40, cols // 3) if wide else cols
         action_rows = []
         col, row = 1, 4
@@ -343,7 +344,7 @@ class GitPanel:
             col += len(label) + 1
         start = row + 2
         available = max(0, rows - start - 3)
-        list_height = available if wide else min(6, available // 2)
+        list_height = available if wide or not output_visible else min(6, available // 2)
         for row, col, label, action, index in action_rows:
             if row < rows - 3:
                 put(row, col, label, len(label), selected if self.focus == 'actions' and index == self.action_index else accent)
@@ -359,8 +360,9 @@ class GitPanel:
         if not self.entries():
             put(start,1,'No entries.',left_width)
         out_col, out_row = (left_width+2,start) if wide else (1,start+list_height+1)
-        put(out_row-1,out_col,self.output_title + (' · focused' if self.focus == 'output' else ''),cols-out_col+1,accent)
-        output_height = max(0, rows-out_row-2)
+        if output_visible:
+            put(out_row-1,out_col,self.output_title + (' · focused' if self.focus == 'output' else ''),cols-out_col+1,accent)
+        output_height = max(0, rows-out_row-2) if output_visible else 0
         # Wrap before scrolling so very long lines remain accessible.
         physical = []
         if self.output_is_diff:
