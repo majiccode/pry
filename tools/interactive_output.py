@@ -152,6 +152,8 @@ def refresh_output(command, stdout, cwd):
             args = ['systemctl'] + (['--user'] if '--user' in words else []) + ['list-units', '--all', '--no-pager']
         elif name == 'launchctl':
             args = ['launchctl', 'list']
+        elif name == 'brew' and any(word in ('list', 'ls') for word in words[1:]):
+            args = words
         elif name == 'lsof':
             args = ['lsof', '-nP', '-i']
         elif name == 'ss':
@@ -184,6 +186,8 @@ def load_view(target, read_text):
         return specialized
     if kind == 'search_match' and Path(target['path']).is_dir():
         return load_view(dict(kind='path', path=target['path']), read_text)
+    if kind == 'path' and target.get('details'):
+        return inspectors.file_details(target['path'])
     if kind == 'path':
         path = Path(target['path'])
         if path.is_symlink():

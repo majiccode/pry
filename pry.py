@@ -45,6 +45,7 @@ from context_budget import build_messages
 from model_providers import validate_profile, stream_chat, DEFAULT_SYSTEM
 from git_panel import GitPanel
 from network_panel import NetworkPanel
+from aws_panel import AwsPanel
 from services_panel import ServicesPanel
 from changes_panel import ChangesPanel
 from storage_panel import StoragePanel
@@ -87,9 +88,9 @@ zoom_notice = ''
 zoom_notice_until = 0
 session_delete_pending = None
 PANEL_ITEMS = [('Chat', '/chat'), ('Git', '/git'), ('Network', '/network'),
-               ('Services', '/services'), ('Watches', '/watch'), ('Files', '/files'),
-               ('Models', '/models'), ('Sessions', '/bookmarks'), ('Scratchpad', '/notes'),
-               ('Changes', '/changes'), ('Storage', '/storage')]
+               ('AWS', '/aws'), ('Services', '/services'), ('Watches', '/watch'),
+               ('Files', '/files'), ('Models', '/models'), ('Sessions', '/bookmarks'),
+               ('Scratchpad', '/notes'), ('Changes', '/changes'), ('Storage', '/storage')]
 BLACK_BG, ORANGE, CYAN = BACKGROUND, ACCENT, SECONDARY
 GREY, WHITE, LIGHT_ORANGE = MUTED, TEXT, WARNING
 BASE_STYLE, SELECTED_STYLE = BASE, SELECTED
@@ -504,6 +505,7 @@ COMMANDS += [('/run', 'Run interactively with terminal handoff: /run <command>')
              ('/inspect', 'Show active inspector context; /inspect off detaches it'),
              ('/git', 'Open Git workspace for the current folder: /git [status]'),
              ('/network', 'Discover SMB/NFS/SFTP servers, mount and browse: /network [URL]'),
+             ('/aws', 'Inspect AWS profiles and URL-related resources: /aws [URL]'),
              ('/sidebar', 'Toggle the session sidebar (Ctrl+B)'),
              ('/topic', 'Start a fresh topic; retain transcript and pins'),
              ('/stop', 'Stop active command or model response'),
@@ -1378,6 +1380,8 @@ def handle_submission(text):
                 investigate_command(argument)
             elif verb == '/network':
                 git_panel = NetworkPanel(conversation.cwd, argument)
+            elif verb == '/aws':
+                git_panel = AwsPanel(conversation.cwd, argument)
             elif verb == '/git':
                 if argument not in ('', 'status', 'cmd'):
                     raise ValueError('Use /git or /git status to open the workspace. Use /cmd git … for raw commands.')
@@ -1733,6 +1737,7 @@ def read_input_event(fd):
             data.extend(byte)
         return ('paste', data[:-6].decode('utf-8', errors='replace'))
     keys = {b'A': ('scroll', -1), b'B': ('scroll', 1),
+            b'P': ('function', 1), b'1P': ('function', 1), b'11~': ('function', 1),
             b'C': ('cursor', 1), b'D': ('cursor', -1),
             b'1;2C': ('select_cursor', 1), b'1;2D': ('select_cursor', -1),
             b'1;2A': ('select_scroll', -1), b'1;2B': ('select_scroll', 1),
@@ -1771,6 +1776,8 @@ def read_input_event(fd):
             if extended and extended[3] == b'3':
                 return ('ignore', None)
             bits = modifier - 1
+            if code == 57364 and not bits:
+                return ('function', 1)
             command, control, shift = bool(bits & (8 | 32)), bool(bits & 4), bool(bits & 1)
             if command and code in (43, 61, 45, 48):
                 return ('zoom', {43: 'in', 61: 'in', 45: 'out', 48: 'reset'}[code])
@@ -3160,6 +3167,7 @@ def draw_pry_header(cols, controls=False):
                  'Changes' if isinstance(git_panel, ChangesPanel) else
                  'Storage' if isinstance(git_panel, StoragePanel) else
                  'Network' if isinstance(git_panel, NetworkPanel) else
+                 'AWS' if isinstance(git_panel, AwsPanel) else
                  'Git' if git_panel else 'Files' if browser else 'Models' if model_picker else 'Chat')
     label = f' Pry / {workspace}'
     available = max(1, right - 1)
@@ -3798,6 +3806,11 @@ def main():
                 continue
                 
             event, value = read_input_event(fd)
+            if event == 'key' and value == '\x03':
+                raise KeyboardInterrupt
+            if event in ('key', 'function', 'newline', 'paste', 'escape', 'cursor', 'scroll',
+                         'page', 'home', 'end', 'pane', 'delete') or event.startswith('select_'):
+                mouse_hover = None
             if event == 'eof':
                 break
             if event == 'cell_size':
@@ -3837,8 +3850,9 @@ def main():
                 if hover_region(mouse_hover) != previous:
                     redraw_screen()
                 continue
-            if event not in ('click', 'drag', 'release', 'right_click', 'ignore'):
+            if event not in ('click', 'drag', 'release', 'right_click', 'ignore', 'hover'):
                 mouse_selection, mouse_press = None, None
+                mouse_hover = None
             if event == 'key' and value == '\x0b':
                 handle_direct_action('panels', 0)
                 redraw_screen()
@@ -3899,6 +3913,14 @@ def main():
                         current_input_buffer = '/run ' + text
                         input_cursor = len(current_input_buffer)
                         status_message = 'Command prepared only. Review it and press Enter to execute in the terminal.'
+                    elif action == 'aws_command':
+                        current_input_buffer = '/run ' + text
+                        input_cursor = len(current_input_buffer)
+                        status_message = 'AWS login command prepared. Press Enter to authenticate, then reopen /aws.'
+                    elif action == 'inspector_command':
+                        current_input_buffer = ('/run ' if text.get('interactive') else '/cmd ') + text['command']
+                        input_cursor = len(current_input_buffer)
+                        status_message = 'Command loaded for review. Replace any {{destination}} with a shell-quoted path. Enter executes.'
                     elif action == 'network_browse' and conversation is not None:
                         conversation.submit_command(shlex.join(['ls', '-la', text]))
                     elif action == 'network_explain' and conversation is not None:
@@ -3918,12 +3940,6 @@ def main():
                 handle_model_picker_event(event, value)
                 redraw_screen()
                 continue
-            if event == 'key' and value == '\x03':
-                if conversation is not None and conversation.active:
-                    stop_session(conversation)
-                    redraw_screen()
-                    continue
-                raise KeyboardInterrupt
             if event == 'key' and value in ('\x10', '\x0e', '\x12'):
                 if value == '\x12':
                     handle_submission('/retry')

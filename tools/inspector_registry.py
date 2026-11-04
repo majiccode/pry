@@ -1,13 +1,16 @@
 """Command-family inspectors. Pages contain data and explicit, reviewable actions."""
 import json
+import mimetypes
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from file_preview import preview_metadata
@@ -167,6 +170,24 @@ def services(args, text, cwd):
     return page('Services · captured', '', entries)
 
 
+@register('brew')
+def brew_packages(args, text, cwd):
+    subcommand = next((arg for arg in args[1:] if not arg.startswith('-')), '')
+    if subcommand not in ('list', 'ls'):
+        return None
+    cask = True if '--cask' in args else False if '--formula' in args else None
+    entries = []
+    for row in text.splitlines():
+        fields = row.strip().split()
+        if not fields or fields[0].startswith('==>') or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+@/-]*', fields[0]):
+            continue
+        name, version = fields[0], ' '.join(fields[1:])
+        entries.append(entry(name + ((' · ' + version) if version else ''),
+                             dict(kind='brew_package', name=name, cask=cask, cwd=cwd)))
+    return page('Homebrew casks · captured' if cask else 'Homebrew packages · captured',
+                'Select a package to see its installed version and location.', entries)
+
+
 @register('rg', 'grep', 'find')
 def searches(args, text, cwd):
     entries = []
@@ -276,6 +297,84 @@ def is_archive(path):
     return str(path).lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'))
 
 
+def human_size(size):
+    value = float(size)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if value < 1024 or unit == 'TiB':
+            return f'{int(value)} {unit}' if unit == 'B' else f'{value:.1f} {unit}'
+        value /= 1024
+
+
+def file_details(path):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ValueError(str(exc))
+    mode = info.st_mode
+    if stat.S_ISLNK(mode):
+        kind = 'symbolic link'
+    elif stat.S_ISDIR(mode):
+        kind = 'directory'
+    elif stat.S_ISREG(mode):
+        kind = 'regular file'
+    elif stat.S_ISFIFO(mode):
+        kind = 'named pipe'
+    elif stat.S_ISSOCK(mode):
+        kind = 'socket'
+    elif stat.S_ISCHR(mode):
+        kind = 'character device'
+    elif stat.S_ISBLK(mode):
+        kind = 'block device'
+    else:
+        kind = 'special file'
+    lines = [f'Path: {path}', f'Type: {kind}',
+             f'Size: {human_size(info.st_size)} ({info.st_size:,} bytes)',
+             f'Permissions: {stat.filemode(mode)} ({oct(stat.S_IMODE(mode))})']
+    try:
+        import grp
+        import pwd
+        owner = pwd.getpwuid(info.st_uid).pw_name
+        group = grp.getgrgid(info.st_gid).gr_name
+    except (ImportError, KeyError, AttributeError):
+        owner, group = str(getattr(info, 'st_uid', '?')), str(getattr(info, 'st_gid', '?'))
+    lines.extend([f'Owner: {owner} ({getattr(info, "st_uid", "?")})',
+                  f'Group: {group} ({getattr(info, "st_gid", "?")})',
+                  f'Links: {getattr(info, "st_nlink", "?")}'])
+    lines.extend([f'Modified: {datetime.fromtimestamp(info.st_mtime):%Y-%m-%d %H:%M:%S}',
+                  f'Accessed: {datetime.fromtimestamp(info.st_atime):%Y-%m-%d %H:%M:%S}',
+                  f'Changed: {datetime.fromtimestamp(info.st_ctime):%Y-%m-%d %H:%M:%S}',
+                  f'Inode: {getattr(info, "st_ino", "?")}'])
+    if stat.S_ISLNK(mode):
+        try:
+            lines.append('Link target: ' + os.readlink(path))
+        except OSError:
+            pass
+    elif stat.S_ISREG(mode):
+        guessed = mimetypes.guess_type(path.name)[0]
+        if guessed:
+            lines.append('MIME guess: ' + guessed)
+    elif stat.S_ISDIR(mode):
+        try:
+            with os.scandir(path) as entries:
+                lines.append('Directory entries: ' + f'{sum(1 for _ in entries):,}')
+        except OSError:
+            pass
+    flags = getattr(info, 'st_flags', 0)
+    if flags:
+        names = [name for name in ('UF_NODUMP', 'UF_IMMUTABLE', 'UF_APPEND', 'UF_OPAQUE', 'UF_HIDDEN',
+                                   'SF_ARCHIVED', 'SF_IMMUTABLE', 'SF_APPEND')
+                 if hasattr(stat, name) and flags & getattr(stat, name)]
+        lines.append('Flags: ' + (', '.join(names) or hex(flags)))
+    try:
+        attributes = os.listxattr(path, follow_symlinks=False)
+    except (AttributeError, OSError, TypeError):
+        attributes = []
+    if attributes:
+        lines.append('Extended attributes: ' + ', '.join(attributes))
+    return page((path.name or str(path)) + ' · details', '\n'.join(lines), attach=str(path))
+
+
 def load(target, read_text):
     kind = target['kind']
     cwd = target.get('cwd', str(Path.cwd()))
@@ -325,6 +424,71 @@ def load(target, read_text):
             actions = [action('Start', [tool, 'kickstart', domain]), action('Restart', [tool, 'kickstart', '-k', domain]),
                        action('Stop', [tool, 'kill', 'SIGTERM', domain])]
         return page(identity + ' · live', text, actions=actions)
+    if kind == 'brew_package':
+        name = target['name']
+        data = json.loads(query(['brew', 'info', '--json=v2', name], cwd))
+        formulae, casks = data.get('formulae') or [], data.get('casks') or []
+        if not formulae and not casks:
+            raise ValueError('Package is not installed: ' + name)
+        cask = target.get('cask') is True or (target.get('cask') is None and not formulae)
+        if cask:
+            if not casks:
+                raise ValueError('Cask is not installed: ' + name)
+            item = casks[0]
+            installed = item.get('installed')
+            if not installed:
+                raise ValueError('Cask is not installed: ' + name)
+            location = Path(query(['brew', '--caskroom', name], cwd).strip()) / str(installed)
+            lines = ['Cask: ' + name, 'Installed version: ' + str(installed),
+                     'Install location: ' + str(location)]
+            latest = str(item.get('version') or '')
+            if latest:
+                lines.append('Latest version: ' + latest)
+            outdated = bool(item.get('outdated')) or bool(latest and str(installed) != latest)
+            status = 'outdated' if outdated else 'up to date'
+            if item.get('pinned'):
+                status += ' · pinned'
+            lines.append('Status: ' + status)
+            targets = [artifact.get('target') for artifact in item.get('artifacts', [])
+                       if isinstance(artifact, dict) and artifact.get('target')]
+            if targets:
+                lines.append('Linked files: ' + ', '.join(targets))
+            if item.get('desc'):
+                lines.append('Description: ' + item['desc'])
+            if item.get('homepage'):
+                lines.append('Homepage: ' + item['homepage'])
+            actions = [action('Upgrade ' + name, ['brew', 'upgrade', '--cask', name])] if outdated else []
+            return page(name + ' · live', '\n'.join(lines), actions=actions)
+        if not formulae:
+            raise ValueError('Formula is not installed: ' + name)
+        item = formulae[0]
+        installed = item.get('installed') or []
+        if not installed:
+            raise ValueError('Formula is not installed: ' + name)
+        lines = ['Package: ' + item.get('full_name', name)]
+        for record in installed:
+            sbom = record.get('sbom')
+            if sbom:
+                location = str(Path(sbom).parent)
+            else:
+                location = str(Path(query(['brew', '--cellar', name], cwd).strip()) / str(record.get('version', '')))
+            lines.append('Installed version: ' + str(record.get('version', '')) + ' · ' + location)
+        lines.append('Prefix: ' + query(['brew', '--prefix', name], cwd).strip())
+        stable = (item.get('versions') or {}).get('stable')
+        if stable:
+            lines.append('Latest version: ' + stable)
+        versions = [str(record.get('version', '')) for record in installed]
+        outdated = bool(item.get('outdated')) or bool(stable and all(version != stable for version in versions))
+        status = 'outdated' if outdated else 'up to date'
+        if item.get('pinned'):
+            status += ' · pinned'
+        lines.append('Status: ' + status)
+        if item.get('desc'):
+            lines.append('Description: ' + item['desc'])
+        if item.get('homepage'):
+            lines.append('Homepage: ' + item['homepage'])
+        actions = [action('Upgrade ' + name, ['brew', 'upgrade', name])] if outdated else []
+        return page(name + ' · live', '\n'.join(lines), actions=actions)
     if kind == 'archive_entry':
         path, name = target['path'], target['name']
         if target['folder']:

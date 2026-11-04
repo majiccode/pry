@@ -23,6 +23,7 @@ from tui_theme import BASE, TEXT, MUTED, ACCENT, SELECTED, ERROR, SEARCH_HIT
 
 
 SGR = re.compile(r'\033\[[0-9;]*m')
+ANSI = re.compile(r'\033(?:\[[0-?]*[ -/]*[@-~]|\][^\007]*(?:\007|\033\\)|[@-_])')
 LINK = re.compile(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>]+', re.IGNORECASE)
 
 
@@ -412,7 +413,7 @@ class ScratchpadPanel:
         if page.get('text'):
             parts.append(page['text'])
         parts.extend(entry['label'] for entry in page.get('entries', []))
-        value = SGR.sub('', '\n'.join(parts)).rstrip('\n') + '\n'
+        value = ANSI.sub('', '\n'.join(parts)).rstrip('\n') + '\n'
         # Grow the fence if the destination preview itself contains backticks.
         opening = self.text[boundary[0]:start]
         marker = re.match(r'(`{3,}|~{3,})', opening)[1]
@@ -625,9 +626,54 @@ class ScratchpadPanel:
         put(rows, ' Tab/Up/Down slider | Left/Right adjust | Home/End bounds | e edit | Esc close', MUTED)
         return ''.join(output)
 
+    def toggle_inspector(self):
+        if self.inspector.focus is not None:
+            self.inspector.close()
+            self.follow = True
+            return
+        block = next((block for block in self.inspector.blocks
+                      if block['start'] <= self.cursor < block['end']), None)
+        if block is None:
+            self.message = 'No inspector available at the cursor.'
+            return
+        if not block.get('page'):
+            self.message = 'Inspector is still loading.'
+            return
+        start = self.text.rfind('\n', 0, self.cursor) + 1
+        end = self.text.find('\n', self.cursor)
+        line = ANSI.sub('', self.text[start:end if end >= 0 else len(self.text)]).strip()
+        entries = block['page'].get('entries', [])
+        best, index = 0, 0
+        for number, entry in enumerate(entries):
+            label = ANSI.sub('', entry.get('label', '')).strip()
+            target = entry.get('target') or {}
+            score = 0
+            if line and label:
+                if label == line:
+                    score = 4
+                elif ' '.join(label.replace(' · ', ' ').split()) == ' '.join(line.split()):
+                    score = 3
+                elif label in line or line in label:
+                    score = 1
+            if target.get('path'):
+                name = Path(target['path']).name
+                if name and re.search(r'(?:^|\s)' + re.escape(name) + r'[/@*=|]?$', line):
+                    score = max(score, 2)
+            if score > best:
+                best, index = score, number
+        self.reveal(block['start'], block['end'])
+        self.inspector.open(block, index=index)
+        self.follow = True
+
     def event(self, event, value):
+        if event == 'function' and value == 1:
+            self.toggle_inspector()
+            return
         if self.inspector.focus is not None:
             if event == 'escape':
+                if self.inspector.pane == 'preview':
+                    self.inspector.event(event, value, self.open_url)
+                    return
                 self.finish_inspection()
                 return
             if event == 'click':
@@ -636,9 +682,25 @@ class ScratchpadPanel:
                             if row == y and left <= x <= right and action == 'inspector_entry'), None)
                 if hit is not None:
                     self.inspector.index = hit
-                    self.inspector.enter(self.open_url)
+                    if hit < len((self.inspector.page or {}).get('entries', [])):
+                        self.inspector.request_preview()
+                    else:
+                        command = self.inspector.enter(self.open_url)
+                        if command:
+                            return ('inspector_command', command)
                     return
-            self.inspector.event(event, value, self.open_url)
+                button = next((arg for row, left, right, action, arg in self.zones
+                               if row == y and left <= x <= right and action == 'preview_action'), None)
+                if button is not None:
+                    self.inspector.action_index = button
+                    self.inspector.pane = 'preview'
+                    command = self.inspector.activate_preview(self.open_url)
+                    if command:
+                        return ('inspector_command', command)
+                    return
+            command = self.inspector.event(event, value, self.open_url)
+            if command:
+                return ('inspector_command', command)
             return
         if event == 'key' and value == '\x03' and self.capture_job is not None:
             self.capture_job.cancel()
@@ -846,7 +908,13 @@ class ScratchpadPanel:
     def _visible(self, line, offset):
         """Display controls as data, retaining offsets into the unmodified file."""
         text, mapping = [], []
-        for index, char in enumerate(line):
+        index = 0
+        while index < len(line):
+            match = ANSI.match(line, index)
+            if match:
+                index = match.end()
+                continue
+            char = line[index]
             if char == '\t':
                 column = sum(last - first + 1 for _, first, last in self.cells(''.join(text)))
                 value = ' ' * (4 - column % 4)
@@ -854,6 +922,7 @@ class ScratchpadPanel:
                 value = char if char.isprintable() or char in ('\u200d', '\ufe0f') else f'\\x{ord(char):02x}'
             text.append(value)
             mapping.extend([(offset + index, offset + index + 1)] * len(value))
+            index += 1
         return ''.join(text), mapping
 
     def measure_line(self, line, width, raw):
@@ -926,7 +995,7 @@ class ScratchpadPanel:
         for row in range(top + 1, rows + 1):
             put(row, 1, ' ' * cols, cols)
         put(top + 1, 1, ' Scratchpad / notes.md | Tab AI chat', cols, ACCENT)
-        put(top + 2, 1, ' Ctrl+E fold | Ctrl+C/X/V clipboard | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find', cols, MUTED)
+        put(top + 2, 1, ' F1 inspect | Ctrl+E fold | Ctrl+C/X/V clipboard | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find', cols, MUTED)
         width, origin = max(1, cols - 4), 4 if cols > 4 else 1
         viewport_height = max(1, rows - (top + 3))
         viewport_start = self.offset
@@ -964,7 +1033,20 @@ class ScratchpadPanel:
                     for label, entry in self.inspector.rows(width, max(8, rows - top - 7), wrap, render=inspect_visible):
                         if entry is not None:
                             inspector_rows[len(physical)] = ('inspector_entry', entry)
-                        physical.append((ACCENT + self._visible(label, 0)[0], position, position, [], []))
+                        plain = self._visible(label, 0)[0]
+                        if isinstance(entry, dict) and entry.get('selected'):
+                            left_width = entry.get('left_width', 0)
+                            styled = SELECTED + plain[:left_width].ljust(left_width) + BASE + ACCENT + plain[left_width:]
+                        elif isinstance(entry, int) and entry == self.inspector.index:
+                            styled = SELECTED + plain.ljust(width) + BASE
+                        elif (isinstance(entry, dict) and entry.get('right') is not None
+                              and self.inspector.pane == 'preview'
+                              and entry['right'] == self.inspector.action_index):
+                            split = entry['left_width'] + 3
+                            styled = ACCENT + plain[:split] + SELECTED + plain[split:] + BASE
+                        else:
+                            styled = ACCENT + plain
+                        physical.append((styled, position, position, [], []))
             focused_boundary = inspector_bounds.get((self.inspector.focus or {}).get('id'))
             if focused_boundary and focused_boundary[1] <= position < focused_boundary[2]:
                 position = end + 1
@@ -1112,7 +1194,8 @@ class ScratchpadPanel:
         if self.inspector.focus is not None:
             self.offset = max(0, cursor_row - 1)
         if self.follow and not self.offset <= cursor_row < self.offset + self.height:
-            self.offset = max(0, cursor_row - self.height // 2)
+            self.offset = max(0, cursor_row if cursor_row < self.offset
+                              else cursor_row - self.height + 1)
         self.offset = min(self.offset, self.max_offset)
         if self.offset != viewport_start and not _settled:
             return self.draw(cols, rows, wrap, styles, top, _settled=True)
@@ -1123,7 +1206,17 @@ class ScratchpadPanel:
             put(row, origin, value, width)
             inspect = inspector_rows.get(self.offset + index)
             if inspect is not None:
-                self.zones.append((row, origin, cols, inspect[0], inspect[1]))
+                if inspect[0] == 'inspector_entry' and isinstance(inspect[1], dict):
+                    entry = inspect[1]
+                    left_width = entry.get('left_width', 0)
+                    if entry.get('left') is not None:
+                        self.zones.append((row, origin, min(cols, origin + left_width - 1),
+                                           'inspector_entry', entry['left']))
+                    if entry.get('right') is not None:
+                        self.zones.append((row, min(cols, origin + left_width + 3), cols,
+                                           'preview_action', entry['right']))
+                else:
+                    self.zones.append((row, origin, cols, inspect[0], inspect[1]))
                 continue
             fold = fold_rows.get(self.offset + index)
             if fold is not None:

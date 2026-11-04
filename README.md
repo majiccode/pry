@@ -224,7 +224,7 @@ should say so. Context refers to captured observations, not an automatic refresh
 of your filesystem or a command that runs without your action.
 
 `/help` lists commands; `/keys` shows shortcuts. Ctrl+P/N recalls input, Ctrl+R
-retries the last AI question, Ctrl+C stops active work (otherwise exits).
+retries the last AI question. Ctrl+C exits Pry from any panel and stops active jobs.
 Alt+Enter inserts a newline. **Tab switches between AI chat and Notes**, preserving
 your chat draft and saving notes and their cursor/scroll position before switching.
 If saving fails, Notes stays open with the error visible. Tab takes priority over
@@ -268,7 +268,7 @@ Ctrl+Z undoes edits; Ctrl+Y redoes them. Esc clears a selection first, otherwise
 returns to chat without changing its draft. Ctrl+A selects all note text, not the
 terminal interface. Drag to select text, or use Shift+arrows, Shift+Home/End, and
 Shift+Page Up/Down; Ctrl+Home/End moves to the document boundaries, with Shift
-extending the selection. Ctrl+C copies, Ctrl+X cuts, and Ctrl+V pastes from
+extending the selection. Ctrl+C exits Pry; Ctrl+X cuts, and Ctrl+V pastes from
 the system clipboard. Your terminal's usual paste shortcut also works. Ctrl+Click
 an HTTP(S) URL or Markdown link to open it in your default browser, provided your
 terminal forwards modified mouse clicks to Pry.
@@ -281,7 +281,7 @@ intercept Cmd keys before Pry receives them. If Cmd+A selects the terminal scree
 use Ctrl+A or configure a terminal key mapping to send hexadecimal `01` for Cmd+A.
 Equivalent mappings are `03` for copy, `18` for cut, `16` for paste, `1a` for undo,
 and `19` for redo. These clipboard/selection mappings are intended for Notes;
-Ctrl+C retains its cancel/exit behavior elsewhere in Pry.
+Ctrl+C always exits Pry, including from Notes.
 
 The scratchpad remembers its caret and scroll position when you close it, switch
 workspaces, or quit Pry. Reopening it, including after a restart, restores both.
@@ -312,8 +312,8 @@ In Notes, type `/capture git status --short` on a line and press Enter to run a
 command in Pry's current working directory. The background capture leaves the
 editor responsive and replaces that line with a timestamped snapshot containing
 the command, directory, combined stdout/stderr, exit status, and duration. Long
-snapshots start folded. **Ctrl+C** cancels a running capture and records the
-cancellation; wait for completion or cancel before leaving Notes. `/capture`
+snapshots start folded. **Ctrl+C** exits Pry and stops a running capture;
+wait for completion before switching panels. `/capture`
 without a command shows a usage hint. Each invocation creates a fresh snapshot.
 
 Completed AI responses, references, and terminal results have a **Send to note**
@@ -324,13 +324,20 @@ undoes the entire insertion.
 
 Compatible command blocks from `/capture` or **Send to note** show **Inspect**
 inside Notes. Click it to browse the existing file, Git, process, JSON/HTTP, and
-other supported inspectors in place. Use **↑/↓** to select, **Enter/→** to open,
-**←/Backspace** to go back (or up a directory at the Files root),
-**PgUp/PgDn** or the wheel to scroll. The navigator replaces the output inside
-its code fence while open. **Esc** returns to editing and autosaves the entire
-current view (including its location), replacing the previous output in that
-same fence. Command metadata stays outside the fence. **Ctrl+Z** restores the
-previous snapshot; **Inspect** resumes from the saved view, including after
+other supported inspectors in place. Use **↑/↓** to select and preview an entry,
+or press **F1** inside a captured block to toggle its inspector and select the
+entry matching the cursor's line. F1 closes it without replacing the snapshot
+and returns to the same editing position. Use
+**Space/→** to open it, **←/Backspace** to go back (or up a directory at the
+Files root), and **PgUp/PgDn** or the wheel to scroll. Wide inspectors show a
+detail pane on the right; file listings include size, type, permissions, owner,
+timestamps, links, and extended attributes. The selected item is highlighted
+across the list column; keyboard navigation clears the mouse hover highlight
+until the mouse moves again. The navigator replaces the output
+inside its code fence while open. **Esc** returns to editing and autosaves the
+entire current view (including its location), replacing the previous output in
+that same fence. Command metadata stays outside the fence. **Ctrl+Z** restores
+the previous snapshot; **Inspect** resumes from the saved view, including after
 reopening Notes. Inspector metadata moves with preceding edits; editing a
 captured block removes its stale inspector, and undo restores it.
 
@@ -446,6 +453,12 @@ Refresh, Filter, Copy, Explain, and Add observations to context. Filter matches
 displayed text (including log severity); type a filter and press Enter to apply
 or Esc to clear. Explain uses the selected observation or current page.
 
+Homebrew package listings from `brew list` or `brew list --versions` open a
+package inspector with the package list on the left and a live detail pane on
+the right. Moving through the list updates installed versions, Cellar/Caskroom
+paths, latest version, and status automatically. Click the Upgrade button, or
+press Tab to focus it and Space, to load the command for review.
+
 The AI automatically receives the **active inspector's state** with each new
 question: selected entry, current detail location, navigation trail, filter,
 pause/loading state, and bounded displayed observations. Selecting a file adds
@@ -530,8 +543,8 @@ if necessary. Closing with Esc returns to your unchanged chat draft.
 
 Everything uses your installed Git, identity, hooks, signing configuration, SSH
 agent and credential helpers. No credentials are stored by this tool. PR creation
-supports `github.com` remotes. Jobs run asynchronously; Ctrl+C cancels the current
-Git process, then Refresh shows its resulting state. Commands requiring terminal
+supports `github.com` remotes. Jobs run asynchronously; Ctrl+C exits Pry and stops
+the current Git process. Commands requiring terminal
 input (such as an SSH password or signing prompt) can be run with `/run git …`.
 Hooks run normally and their failures appear in the output pane.
 
@@ -585,11 +598,40 @@ Verification uses syntax checks and manual smoke checks.
 
 ## Panels menu
 
-The orange header has one **Panels** dropdown for Chat, Git, Network, Services,
-Watches, Files, Models, Sessions, Scratchpad, Changes, and Storage. Click it from any screen, or type `/panels`
+The orange header has one **Panels** dropdown for Chat, Git, Network, AWS,
+Services, Watches, Files, Models, Sessions, Scratchpad, Changes, and Storage. Click it from any screen, or type `/panels`
 in chat. Up/Down or Tab selects a destination; Enter opens it; Esc dismisses it.
 Switching panels preserves your chat draft. Finish or cancel an active panel job
 before switching. The header shows active-watch and alert counts when present.
+
+## AWS
+
+Open **Panels > AWS** or `/aws`, optionally with a URL: `/aws https://docs.example.com/login`.
+The panel reads profiles from the AWS CLI configuration (`~/.aws/config` and
+`~/.aws/credentials`, honoring `AWS_CONFIG_FILE`, `AWS_CREDENTIALS_FILE`, and
+`AWS_PROFILE`) and uses the installed `aws` command for read-only calls. No
+credentials are read, stored, or displayed by Pry.
+
+Choose **Use profile** to verify the identity with STS. For SSO profiles, choose
+**SSO login**; Pry prepares `aws sso login --profile NAME` for the normal `/run`
+terminal handoff so the browser/device flow runs in your terminal, not inside the
+panel. **Authenticate** rechecks the selected profile.
+
+**Look up URL** correlates a hostname with resources in the chosen search scope:
+Route 53 records and aliases, CloudFront distributions and origins, S3 buckets,
+ACM certificates, EC2 instances, RDS instances/clusters, ElastiCache clusters,
+load balancers, Lambda functions, API Gateway APIs/domains, ECS/EKS clusters,
+Bedrock models/agents/knowledge bases, and tagged resources returned by the
+Resource Groups Tagging API. Search scope defaults to the profile's region; use
+**Regions** with one region, a comma-separated list, or `all`.
+
+The **Resources** list is ranked by match strength. Enter shows identifiers, ARN,
+tags, endpoints, and the AWS console link. **Ctrl+Click** a row (or choose
+**Open console**) to open its AWS console page in your browser. The **Profiles**
+and **Regions** tabs provide profile selection and direct region console links;
+the **Regions** tab also shows which regions were searched and their match counts.
+Ctrl+C exits Pry and stops an active lookup. Missing permissions or unavailable services are
+reported as diagnostics rather than treated as a failed lookup.
 
 ## Storage
 
@@ -654,8 +696,8 @@ plus second-resolution start time; discovery helper processes are excluded.
 Missing processes/listeners mean **no longer observed**, not proven exit/closure.
 There is no sudo, restoration, automatic AI request, or background polling.
 
-Both panels support Ctrl+F search, keyboard/mouse navigation, and Ctrl+C scan
-cancellation. Cancellation is cooperative between filesystem calls. Snapshots are
+Both panels support Ctrl+F search and keyboard/mouse navigation. Ctrl+C exits Pry
+and cancels active scans cooperatively between filesystem calls. Snapshots are
 not atomic and files may change during scanning. Results and captured text stay
 in memory for the current application session and are retained when switching
 panels, separately for each conversation and starting folder; they are not saved
@@ -765,7 +807,7 @@ not enumerate IP ranges; other servers can be added manually:
 
 Use the four tabs: **Servers**, **Shares / folders**, **Mounted**, and **Tools**.
 Select an item, then use an action; Tab switches focus, arrows select, Enter
-activates, Esc closes, and Ctrl+C cancels discovery/listing.
+activates, Esc closes, and Ctrl+C exits Pry and cancels discovery/listing.
 In **Shares / folders**, click an SMB share or select it and press Enter to
 mount it on macOS. Complete the native login dialog if prompted. The panel
 switches to **Mounted**, selects the local folder, and shows its path for file
