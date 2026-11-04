@@ -3814,6 +3814,11 @@ def main():
                 
             event, value = read_input_event(fd)
             if event == 'key' and value == '\x03':
+                if isinstance(git_panel, ScratchpadPanel):
+                    # Ctrl+C / Cmd+C in notes is copy, never exit
+                    git_panel.event('key', '\x03')
+                    redraw_screen()
+                    continue
                 raise KeyboardInterrupt
             if event in ('key', 'function', 'newline', 'paste', 'escape', 'cursor', 'scroll',
                          'page', 'home', 'end', 'pane', 'delete') or event.startswith('select_'):
@@ -4057,6 +4062,10 @@ def main():
                 paste_clipboard()
                 redraw_screen()
             elif ch == '\x03':
+                if isinstance(git_panel, ScratchpadPanel):
+                    # Ctrl+C / Cmd+C in notes is copy, never exit
+                    redraw_screen()
+                    continue
                 raise KeyboardInterrupt
             elif ch.isprintable():
                 insert_input(ch)

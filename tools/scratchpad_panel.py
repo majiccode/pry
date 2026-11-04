@@ -195,6 +195,7 @@ class ScratchpadPanel:
         self.shared_text = text
         if self.mode == 'shared':
             self.text = text
+            self.paste_blocks = []
             self.cursor = min(self.cursor, len(self.text))
             self.selection = self.anchor = None
             self.dirty = True
@@ -323,6 +324,7 @@ class ScratchpadPanel:
                 self.title = None
         self.text = self.text[:start] + value + self.text[end:]
         self.paste_blocks = [b for b in self.paste_blocks if b['start'] < b['end']
+                             and b['start'] <= len(self.text) and b['end'] <= len(self.text)
                              and (b['start'] == 0 or self.text[b['start'] - 1] == '\n')
                              and (b['end'] == len(self.text) or self.text[b['end'] - 1] == '\n')]
         self.cursor = start + len(value)
@@ -807,6 +809,7 @@ class ScratchpadPanel:
             if tab_hit == 'tab_private':
                 self.mode = 'private'
                 self.text = self.private_text
+                self.paste_blocks = []
                 self.cursor = min(self.cursor, len(self.text))
                 self.selection = self.anchor = None
                 self.follow = True
@@ -815,6 +818,7 @@ class ScratchpadPanel:
             if tab_hit == 'tab_shared':
                 self.mode = 'shared'
                 self.text = self.shared_text
+                self.paste_blocks = []
                 self.cursor = min(self.cursor, len(self.text))
                 self.selection = self.anchor = None
                 self.follow = True
