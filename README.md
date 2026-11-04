@@ -3,7 +3,7 @@
 A terminal assistant with interactive inspectors and AI powered by Ollama or
 OpenAI-compatible / Anthropic-compatible APIs.
 
-Run `python3 ai-tool.py` in a terminal to open the TUI. Requires Python 3.10+,
+Run `python3 pry.py` in a terminal to open the TUI. Requires Python 3.10+,
 macOS or Linux, and either **Ollama running locally with a downloaded model** or
 an **OpenAI-compatible / Anthropic-compatible API endpoint**. For API setup,
 open `/models` and choose **Add API**; Ollama is not required for API models.
@@ -44,14 +44,17 @@ ollama --version
 ollama pull qwen2.5-coder:7b
 ./build-model.sh linux-cmds-7b
 ollama list
-python3 ai-tool.py --doctor
-python3 ai-tool.py
+python3 pry.py --doctor
+python3 pry.py
 ```
 
 The explicit `linux-cmds-7b` build name matches the app's initial default.
 `./build-model.sh` without an argument instead creates `ops-gpt-7b`; select that
 name with `/model ops-gpt-7b` if you use it. The bundled `Modelfile` builds on
 `qwen2.5-coder:7b` and adds terminal-focused instructions and generation settings.
+
+When a project-local `.venv` exists, `python3 pry.py` automatically launches
+with its Python. An already active virtual environment is respected.
 
 The app connects to `http://localhost:11434`; no API key or cloud account is
 needed for downloaded local models. Internet access is needed for installation
@@ -78,7 +81,7 @@ Set the key in the shell that launches the app, for example:
 
 ```sh
 export OPENAI_API_KEY='your-api-key'
-python3 ai-tool.py
+python3 pry.py
 ```
 
 Use Tab / Shift-Tab to move fields, Backspace to edit, Ctrl-U to clear a field,
@@ -101,8 +104,8 @@ Ollama models retain their own Modelfile instructions.
 The saved selection is also used by the CLI. Override it for one invocation:
 
 ```sh
-python3 ai-tool.py --provider 'My API profile' "Explain rsync --archive"
-python3 ai-tool.py --provider ollama --model linux-cmds-7b "Explain find -type f"
+python3 pry.py --provider 'My API profile' "Explain rsync --archive"
+python3 pry.py --provider ollama --model linux-cmds-7b "Explain find -type f"
 ```
 
 `--provider` accepts a saved profile name or ID, or `ollama`. `--model` overrides
@@ -135,7 +138,7 @@ To try a smaller model without rebuilding the bundled variant:
 
 ```sh
 ollama pull qwen2.5-coder:3b
-python3 ai-tool.py --model qwen2.5-coder:3b "Explain find -type f"
+python3 pry.py --model qwen2.5-coder:3b "Explain find -type f"
 ```
 
 In the TUI, use `/models` or `/model qwen2.5-coder:3b` to select and save the
@@ -148,7 +151,7 @@ base, change the `FROM` line in `Modelfile`, build under a new name (for example
 - **`ollama: command not found`:** finish the Ollama installation and reopen your
   terminal so its PATH is refreshed.
 - **Connection refused:** open the macOS Ollama app, start the Linux service, or
-  run `ollama serve`; then retry `python3 ai-tool.py --doctor`.
+  run `ollama serve`; then retry `python3 pry.py --doctor`.
 - **Model not found:** check `ollama list`, pull the desired base model, and either
   build `linux-cmds-7b` as above or select an installed model with `/model`.
 - **Slow responses or out of memory:** try the 3B or 1.5B model, close other
@@ -157,10 +160,10 @@ base, change the `FROM` line in `Modelfile`, build under a new name (for example
 ## CLI examples
 
 ```sh
-python3 ai-tool.py --doctor
-python3 ai-tool.py "How do I find large files?"
-git status --short | python3 ai-tool.py "Explain this output"
-python3 ai-tool.py --model linux-cmds-7b "Explain rsync --archive"
+python3 pry.py --doctor
+python3 pry.py "How do I find large files?"
+git status --short | python3 pry.py "Explain this output"
+python3 pry.py --model linux-cmds-7b "Explain rsync --archive"
 ```
 
 CLI responses go to stdout; failures go to stderr with a nonzero exit code.
@@ -583,68 +586,10 @@ Verification uses syntax checks and manual smoke checks.
 ## Panels menu
 
 The orange header has one **Panels** dropdown for Chat, Git, Network, Services,
-Watches, Files, Models, Sessions, Scratchpad, Changes, Storage, and Chiptune. Click it from any screen, or type `/panels`
+Watches, Files, Models, Sessions, Scratchpad, Changes, and Storage. Click it from any screen, or type `/panels`
 in chat. Up/Down or Tab selects a destination; Enter opens it; Esc dismisses it.
 Switching panels preserves your chat draft. Finish or cancel an active panel job
 before switching. The header shows active-watch and alert counts when present.
-
-## Chiptune
-
-Open **Panels > Chiptune** or `/synth` for **Circuit**, a four-channel softsynth
-and tracker. Editing and saving work without audio packages. Install optional
-audio dependencies into the Python environment that runs Pry:
-
-```sh
-python3 -m pip install -r requirements-audio.txt
-```
-
-When a project-local `.venv` exists, `python3 ai-tool.py` automatically launches
-with its Python. An already active virtual environment is respected. Restart Pry
-after installing dependencies or creating the environment.
-
-Live playback uses sounddevice / PortAudio. If the audio backend is unavailable,
-macOS users can install it with `brew install portaudio`; Linux users may need
-their distribution's PortAudio package (for example `libportaudio2` on Debian).
-WAV export needs NumPy but no audio device. Dependency/device errors appear in
-the panel, not at app startup.
-
-Start with **Examples** (Ctrl+E): Copper Comet, Pocket Observatory, and Rain on
-the Arcade are original two-pattern tunes with lead, bass, kick, and noise
-percussion instruments. Loading an example requires confirmation and saves the
-previous project to a unique JSON backup first. A new workspace starts blank.
-
-- **Space** plays/stops; **Esc** saves, stops audio, and closes. **?** opens help.
-- **Tab** switches tracker/editor. Wide terminals show both; narrow terminals
-  show the selected view. Buttons and tracker cells support mouse clicks.
-- Tracker arrows select row/channel. `z s x d c v g b h n j m` enter the twelve
-  chromatic notes beginning at C4. `[` / `]` change octave; `+` / `-` select the
-  instrument; Enter auditions. Note entry advances one row.
-- `.` inserts note-off; Delete/Backspace clears a cell. Empty cells sustain the
-  previous note. Each row is a sixteenth note.
-- Editor Up/Down selects a field; Left/Right adjusts it. Enter edits names,
-  title, or pattern order, or auditions the instrument on other fields.
-- Instruments offer sine, triangle, saw, square/pulse, and noise oscillators,
-  tuning, volume, pulse width, and low-pass cutoff. Select an envelope target
-  to edit its attack, decay, sustain, release, and modulation depth. Targets are
-  volume, pitch (semitones), cutoff (Hz), and pulse width.
-- **New I** / **Copy I** create instruments. **Add P** / **Dup P** create patterns;
-  **Order** specifies playback using space-separated, one-based pattern numbers.
-  Pattern lengths are 16, 32, or 64 rows; shortening requires confirmation.
-- **Loop**, **Mute**, and **Solo** affect the next playback snapshot. Stop and
-  replay to hear edits. Ctrl+N creates an instrument, Ctrl+U mutes the selected
-  channel, Ctrl+O solos, Ctrl+P duplicates a pattern, and Ctrl+L toggles looping.
-- **WAV** / Ctrl+W exports mono 22050 Hz, 16-bit PCM, including release tails.
-  Existing exports require overwrite confirmation. Live waveform and FFT strips
-  visualize actual audio sent to the device.
-
-Projects autosave atomically to `~/.ai-tool/synth.json` (or
-`$AI_TOOL_WORKDIR/synth.json`); UI selection lives in `pry-state.json`. Ctrl+S
-retries failed saves. External changes are never silently overwritten; closing
-with conflicting memory edits offers a separate recovered JSON file. WAV export
-uses the same project basename. Songs are limited to four monophonic channels,
-32 instruments, 16 patterns, 64 order entries, and 120 seconds including release.
-Rendering runs in a worker; canceling prevents audio from starting afterward.
-Closing waits for an in-progress render and releases the output device.
 
 ## Storage
 
