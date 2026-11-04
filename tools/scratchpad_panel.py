@@ -18,6 +18,7 @@ from pry_state import load_state, save_state
 from note_graph import Graph, EXAMPLE_SOURCE
 from note_folding import sections, prepare_paste, highlight_json
 from command_runner import CommandJob
+from network_notes import DEFAULT_PEER_HOST, DEFAULT_PEER_PORT
 from note_inspector import NoteInspector
 from network_notes import NetworkNotes
 from tui_theme import BASE, TEXT, MUTED, ACCENT, SELECTED, ERROR, SEARCH_HIT
@@ -86,7 +87,7 @@ class ScratchpadPanel:
         self.mode = 'private'
         self.shared_text = ''
         self.private_text = self.text
-        self.network_version = -1
+        self.network_versions = {}
         self.discover_results = {}
         self.discovering = False
         self._last_synced_text = None
@@ -143,6 +144,8 @@ class ScratchpadPanel:
 
     @property
     def busy(self):
+        if self.mode == 'shared':
+            return self.capture_job is not None
         return self.dirty or self.capture_job is not None
 
     def file_stamp(self):
@@ -184,21 +187,20 @@ class ScratchpadPanel:
         except OSError as exc:
             self.message = f'Shared notes not saved: {exc}'
 
-    def apply_remote(self, text, version):
+    def apply_remote(self, text, version, peer_id=None):
         try:
             version = int(version)
         except (TypeError, ValueError):
             return
-        if version <= self.network_version:
+        if version <= self.network_versions.get(peer_id, -1):
             return
-        self.network_version = version
+        self.network_versions[peer_id] = version
         self.shared_text = text
         if self.mode == 'shared':
             self.text = text
             self.paste_blocks = []
             self.cursor = min(self.cursor, len(self.text))
             self.selection = self.anchor = None
-            self.dirty = True
             self.follow = True
             self.message = 'Shared notes updated'
 
@@ -261,7 +263,7 @@ class ScratchpadPanel:
                     self.message = 'Peer disconnected'
                     changed = True
                 elif kind == 'sync':
-                    self.apply_remote(payload.get('text', ''), payload.get('version', 0))
+                    self.apply_remote(payload.get('text', ''), payload.get('version', 0), payload.get('id'))
                     changed = True
         return changed
 
@@ -330,7 +332,12 @@ class ScratchpadPanel:
         self.cursor = start + len(value)
         self.selection = self.anchor = None
         self.dirty = self.follow = True
+        if self.mode == 'shared':
+            self.shared_text = self.text
+        else:
+            self.private_text = self.text
         self.hit_rows = {}
+        self.zones = []
         self.zones = []
         if self.mode != 'shared':
             self.save()
@@ -807,6 +814,7 @@ class ScratchpadPanel:
                             if row == y and left <= x <= right
                             and action in ('tab_private', 'tab_shared', 'discover')), None)
             if tab_hit == 'tab_private':
+                self.shared_text = self.text
                 self.mode = 'private'
                 self.text = self.private_text
                 self.paste_blocks = []
@@ -816,19 +824,23 @@ class ScratchpadPanel:
                 self.message = 'Private notes'
                 return
             if tab_hit == 'tab_shared':
+                self.private_text = self.text
                 self.mode = 'shared'
                 self.text = self.shared_text
                 self.paste_blocks = []
                 self.cursor = min(self.cursor, len(self.text))
                 self.selection = self.anchor = None
                 self.follow = True
-                self.message = 'Shared network notes'
+                self.message = 'Shared network notes (click Discover to connect)'
                 return
             if tab_hit == 'discover':
                 if self.network:
+                    if not self.network._running.is_set():
+                        self.network.start()
                     self.discover_results = self.network.list_peers()
+                    port = self.network.tcp_port
+                    self.message = f'Listening on port {port} | /connect host:port to join a peer'
                 self.discovering = True
-                self.message = f'{len(self.discover_results)} peer(s) found'
                 return
             inspect = next((arg for row, left, right, action, arg in self.zones
                             if row == y and left <= x <= right and action == 'inspect'), None)
@@ -927,6 +939,30 @@ class ScratchpadPanel:
                 self.cursor = start + len('```graph\n')
                 key = hashlib.sha256(EXAMPLE_SOURCE.encode('utf-8')).hexdigest()
                 self.open_graph(key, EXAMPLE_SOURCE)
+            elif self.text[start:end].strip().split(' ', 1)[0] == '/connect':
+                if not self.network:
+                    self.message = 'Network notes not available'
+                else:
+                    parts = self.text[start:end].strip().split(' ', 1)
+                    if len(parts) < 2:
+                        host, port = DEFAULT_PEER_HOST, DEFAULT_PEER_PORT
+                    elif ':' not in parts[1]:
+                        self.message = 'Usage: /connect host:port'
+                    else:
+                        host, port_str = parts[1].rsplit(':', 1)
+                        try:
+                            port = int(port_str)
+                        except ValueError:
+                            self.message = 'Invalid port'
+                        else:
+                            if not self.network._running.is_set():
+                                self.network.start()
+                            peer_id = f'{host}:{port}'
+                            self.network.add_peer(peer_id, host, port, name=host)
+                            if self.network.connect(peer_id):
+                                self.message = f'Connecting to {host}:{port}…'
+                            else:
+                                self.message = f'Failed to connect to {host}:{port}'
             else:
                 self.insert('\n')
         elif event == 'paste':

@@ -3767,7 +3767,6 @@ def main():
     initialize_app()
     assert conversation is not None
     network_notes = NetworkNotes()
-    network_notes.start()
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     terminal_settings = old_settings
