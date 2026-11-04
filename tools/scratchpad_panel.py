@@ -19,6 +19,7 @@ from note_graph import Graph, EXAMPLE_SOURCE
 from note_folding import sections, prepare_paste, highlight_json
 from command_runner import CommandJob
 from note_inspector import NoteInspector
+from network_notes import NetworkNotes
 from tui_theme import BASE, TEXT, MUTED, ACCENT, SELECTED, ERROR, SEARCH_HIT
 
 
@@ -29,7 +30,7 @@ LINK = re.compile(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>]+', re.
 
 class ScratchpadPanel:
     def __init__(self, path, cells, clipboard_copy=None, clipboard_paste=None, open_url=None,
-                 cwd=None, shell=None, timeout: float =120):
+                 cwd=None, shell=None, timeout: float =120, network=None):
         self.path = Path(path)
         self.cells = cells
         self.clipboard_copy = clipboard_copy
@@ -81,6 +82,21 @@ class ScratchpadPanel:
         self.inspector = NoteInspector()
         self.collapsed_sections = set()
         self.state_path = self.path.parent / 'pry-state.json'
+        self.network = network
+        self.mode = 'private'
+        self.shared_text = ''
+        self.private_text = self.text
+        self.network_version = -1
+        self.discover_results = {}
+        self.discovering = False
+        self._last_synced_text = None
+        self.shared_path = self.path.parent / 'shared.md'
+        try:
+            self.shared_text = self.shared_path.read_text(encoding='utf-8')
+        except OSError:
+            self.shared_text = ''
+        if self.network:
+            self.network.set_pending_text(self.shared_text)
         try:
             position = load_state(self.state_path).get('scratchpad', {})
             if isinstance(position, dict):
@@ -162,6 +178,29 @@ class ScratchpadPanel:
                 except OSError:
                     pass
 
+    def _save_shared(self):
+        try:
+            self.shared_path.write_text(self.text, encoding='utf-8')
+        except OSError as exc:
+            self.message = f'Shared notes not saved: {exc}'
+
+    def apply_remote(self, text, version):
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            return
+        if version <= self.network_version:
+            return
+        self.network_version = version
+        self.shared_text = text
+        if self.mode == 'shared':
+            self.text = text
+            self.cursor = min(self.cursor, len(self.text))
+            self.selection = self.anchor = None
+            self.dirty = True
+            self.follow = True
+            self.message = 'Shared notes updated'
+
     def poll(self):
         changed = self.inspector.poll()
         if changed:
@@ -205,6 +244,24 @@ class ScratchpadPanel:
                                    result.get('cwd', job.cwd), result['exit_code'])
             self.save_position()
             changed = True
+        if self.network:
+            while True:
+                try:
+                    kind, payload = self.network.events.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == 'peer_discovered':
+                    self.discover_results[payload['id']] = payload
+                    changed = True
+                elif kind == 'peer_connected':
+                    self.message = f'Connected to {payload.get("name", "peer")}'
+                    changed = True
+                elif kind == 'peer_disconnected':
+                    self.message = 'Peer disconnected'
+                    changed = True
+                elif kind == 'sync':
+                    self.apply_remote(payload.get('text', ''), payload.get('version', 0))
+                    changed = True
         return changed
 
     def start_capture(self, start, end, command):
@@ -273,7 +330,14 @@ class ScratchpadPanel:
         self.dirty = self.follow = True
         self.hit_rows = {}
         self.zones = []
-        self.save()
+        if self.mode != 'shared':
+            self.save()
+        elif self.network:
+            if self.text != self._last_synced_text:
+                self._last_synced_text = self.text
+                self.network.set_pending_text(self.text)
+                self.network.send_sync()
+                self._save_shared()
 
     def snapshot(self):
         return (self.text, self.cursor, self.selection, self.title,
@@ -737,6 +801,31 @@ class ScratchpadPanel:
             return
         if event == 'click':
             x, y = value
+            tab_hit = next((action for row, left, right, action, arg in self.zones
+                            if row == y and left <= x <= right
+                            and action in ('tab_private', 'tab_shared', 'discover')), None)
+            if tab_hit == 'tab_private':
+                self.mode = 'private'
+                self.text = self.private_text
+                self.cursor = min(self.cursor, len(self.text))
+                self.selection = self.anchor = None
+                self.follow = True
+                self.message = 'Private notes'
+                return
+            if tab_hit == 'tab_shared':
+                self.mode = 'shared'
+                self.text = self.shared_text
+                self.cursor = min(self.cursor, len(self.text))
+                self.selection = self.anchor = None
+                self.follow = True
+                self.message = 'Shared network notes'
+                return
+            if tab_hit == 'discover':
+                if self.network:
+                    self.discover_results = self.network.list_peers()
+                self.discovering = True
+                self.message = f'{len(self.discover_results)} peer(s) found'
+                return
             inspect = next((arg for row, left, right, action, arg in self.zones
                             if row == y and left <= x <= right and action == 'inspect'), None)
             if inspect is not None:
@@ -766,6 +855,8 @@ class ScratchpadPanel:
             self.search.open(candidates, current)
             return
         if event == 'key' and value in ('\x03', '\x18'):
+            if not self.selection:
+                self.message = 'Nothing selected'
             self._copy(cut=value == '\x18')
             return
         if event == 'escape':
@@ -982,6 +1073,8 @@ class ScratchpadPanel:
         self.hit_rows = {}
         self.zones = []
         self.raw_lines = set()
+        _visible_cache = {}
+        _cells_cache = {}
         if cols <= 0 or rows <= top:
             return ''
         if self.graph_focus is not None:
@@ -995,7 +1088,20 @@ class ScratchpadPanel:
         for row in range(top + 1, rows + 1):
             put(row, 1, ' ' * cols, cols)
         put(top + 1, 1, ' Scratchpad / notes.md | Tab AI chat', cols, ACCENT)
-        put(top + 2, 1, ' F1 inspect | Ctrl+E fold | Ctrl+C/X/V clipboard | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find', cols, MUTED)
+        priv_mark = '▸' if self.mode == 'private' else ' '
+        shar_mark = '▸' if self.mode == 'shared' else ' '
+        tab_line = f'  [{priv_mark}Private] [{shar_mark}Shared] [Discover]'
+        put(top + 2, 1, tab_line, cols, MUTED)
+        self.zones.append((top + 2, 3, 12, 'tab_private', None))
+        self.zones.append((top + 2, 14, 22, 'tab_shared', None))
+        self.zones.append((top + 2, 24, 33, 'discover', None))
+        hint_cols = cols - len(tab_line) - 2
+        if hint_cols > 40:
+            hint = f' | F1 inspect | Ctrl+E fold | Ctrl+C/X/V clipboard | click tabs | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find'
+            put(top + 2, len(tab_line) + 2, hint, cols, MUTED)
+        elif hint_cols > 10:
+            hint = f' | 1/2 tab | d discover'
+            put(top + 2, len(tab_line) + 2, hint, cols, MUTED)
         width, origin = max(1, cols - 4), 4 if cols > 4 else 1
         viewport_height = max(1, rows - (top + 3))
         viewport_start = self.offset
@@ -1087,7 +1193,14 @@ class ScratchpadPanel:
                     cursor_row = len(physical) + count - 1
             if not visible:
                 physical.extend(('', position, end, [], []) for _ in range(count))
-            safe, mapping = self._visible(line, position) if visible else ('', [])
+                safe, mapping = '', []
+            else:
+                key = (line, position)
+                cached = _visible_cache.get(key)
+                if cached is None:
+                    cached = self._visible(line, position)
+                    _visible_cache[key] = cached
+                safe, mapping = cached
             links = []
             for match in LINK.finditer(line if visible else ''):
                 url = match[2] or match[0].rstrip('.,;:!?)\'"')
@@ -1102,7 +1215,11 @@ class ScratchpadPanel:
                 chunks, display_map = [], []
             elif raw:
                 chunks, chunk, used = [], '', 0
-                for unit, first, last in self.cells(safe):
+                cell_list = _cells_cache.get(safe)
+                if cell_list is None:
+                    cell_list = list(self.cells(safe))
+                    _cells_cache[safe] = cell_list
+                for unit, first, last in cell_list:
                     size = last - first + 1
                     if used and used + size > width:
                         chunks.append(chunk)
@@ -1145,7 +1262,11 @@ class ScratchpadPanel:
                     if SGR.fullmatch(token):
                         style = token if token == '\033[0m' else style + token
                         continue
-                    for unit, first, last in self.cells(token):
+                    cell_list = _cells_cache.get(token)
+                    if cell_list is None:
+                        cell_list = list(self.cells(token))
+                        _cells_cache[token] = cell_list
+                    for unit, first, last in cell_list:
                         size = last - first + 1
                         source = local_map[index:index + len(unit)]
                         a, b = min(p[0] for p in source), max(p[1] for p in source)

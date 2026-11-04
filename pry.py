@@ -52,6 +52,7 @@ from storage_panel import StoragePanel
 from watches import WatchEngine
 from watches_panel import WatchesPanel
 from scratchpad_panel import ScratchpadPanel
+from network_notes import NetworkNotes
 from spotlight_search import SpotlightSearch
 from terminal_zoom import TerminalZoom
 from response_rendering import render_markdown
@@ -79,6 +80,7 @@ input_history_draft = ''
 session_filter = ''
 sidebar_visible = True
 git_panel = None
+network_notes = None
 watch_engine = None
 panels_menu = None
 panels_query = ''
@@ -1332,6 +1334,7 @@ def handle_workspace_tab(event, value):
             git_panel = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
                                        clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                        open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
+                                       network=network_notes,
                                        shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
         except (OSError, ValueError) as exc:
             status_message = f'Could not open notes: {exc}'
@@ -1361,6 +1364,7 @@ def handle_submission(text):
                 git_panel = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
                                            clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                            open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
+                                            network=network_notes,
                                             shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
             elif verb == '/watch':
                 if watch_engine is None:
@@ -3654,6 +3658,7 @@ def handle_direct_action(action_type, index):
             notes = ScratchpadPanel(settings_path().parent / 'notes.md', text_cells,
                                    clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                    open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
+                                   network=network_notes,
                                    shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
             notes.receive_result(item)
             git_panel = notes
@@ -3749,7 +3754,7 @@ def cli_main():
 def main():
     global current_input_buffer, input_cursor, follow_output, active_pane, mouse_selection, mouse_press, inline_focus
     global terminal_settings, input_history_index, input_history_draft, git_panel, status_message, mouse_hover, panels_menu, panels_query
-    global about_open
+    global about_open, network_notes
     global zoom_notice, zoom_notice_until
     
     if len(sys.argv) > 1 or not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -3761,6 +3766,8 @@ def main():
 
     initialize_app()
     assert conversation is not None
+    network_notes = NetworkNotes()
+    network_notes.start()
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     terminal_settings = old_settings
@@ -4071,6 +4078,8 @@ def main():
                 git_panel.thread.join(timeout=3)
             if isinstance(git_panel, ScratchpadPanel):
                 git_panel.poll()
+        if network_notes is not None:
+            network_notes.stop()
         jobs = list(command_jobs.values())
         for job in jobs:
             job.cancel()
