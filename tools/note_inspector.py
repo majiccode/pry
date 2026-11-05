@@ -79,6 +79,7 @@ class NoteInspector:
                     self.blocks.remove(current)
                 else:
                     current['page'] = result
+                    self.open(current)
         self.worker(lambda: recognize_output(**block['source']), recognized)
 
     def edit(self, start, end, length):
@@ -168,6 +169,14 @@ class NoteInspector:
             self.preview = dict(title=item.get('label', ''), entries=[],
                                 text='URL: ' + target.get('url', '') + '\n\nPress Space to open this link.')
             return
+        if target.get('kind') == 'file_retrieve':
+            self.preview = dict(title='Retrieve from peer', entries=[],
+                                text=('File not available locally.\n'
+                                      f'Shared by: {target.get("user_name", "unknown")} '
+                                      f'({target.get("user_id", "unknown")})\n'
+                                      f'Requested path: {target.get("path", "")}\n'
+                                      'Activate to fetch it from the peer.'))
+            return
         preview_target = dict(target, details=True) if target.get('kind') == 'path' else target
         key = json.dumps(preview_target, sort_keys=True, default=str)
         if key in self.preview_cache:
@@ -209,6 +218,8 @@ class NoteInspector:
             open_url(target['url'])
             return
         if target['kind'] == 'inspector_command':
+            return target
+        if target.get('kind') == 'file_retrieve':
             return target
         self.load(target)
 

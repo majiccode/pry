@@ -62,6 +62,10 @@ class ScratchpadPanel:
         self.drag_raw = None
         self.raw_lines = set()
         self.measure_cache = {}
+        self.text_version = 0
+        self._draw_text_version = -1
+        self._physical_cache = None
+        self._numbers_cache = None
         self.title = None
         self.offset = 0
         self.max_offset = 0
@@ -129,6 +133,10 @@ class ScratchpadPanel:
                     self.mode = 'shared'
                     self.message = 'Shared network notes'
                     self.text = self.shared_text
+                if position.get('user_id'):
+                    self.user_id = position['user_id']
+                if position.get('user_name'):
+                    self.user_name = position['user_name']
                 if position.get('fold_digest') == hashlib.sha256(self.text.encode()).hexdigest():
                     self.inspector.blocks = [b for b in position.get('inspectors', [])
                                              if isinstance(b, dict) and type(b.get('start')) is int
@@ -166,10 +174,12 @@ class ScratchpadPanel:
     def save_position(self):
         try:
             save_state(self.state_path, 'scratchpad',
-                       {'cursor': self.cursor, 'offset': self.offset,
-                          'graphs': self.graph_values,
-                          'inspectors': self.inspector.blocks,
-                          'mode': self.mode,
+           {'cursor': self.cursor, 'offset': self.offset,
+              'graphs': self.graph_values,
+              'inspectors': self.inspector.blocks,
+              'user_id': self.user_id,
+              'user_name': self.user_name,
+              'mode': self.mode,
                           'shared': {'host': self.shared_host, 'port': self.shared_port,
                                      'role': self.network_role},
                           'fold_digest': hashlib.sha256(self.text.encode()).hexdigest(),
@@ -437,6 +447,7 @@ class ScratchpadPanel:
             else:
                 self.title = None
         self.text = self.text[:start] + value + self.text[end:]
+        self.text_version += 1
         self.paste_blocks = [b for b in self.paste_blocks if b['start'] < b['end']
                              and b['start'] <= len(self.text) and b['end'] <= len(self.text)
                              and (b['start'] == 0 or self.text[b['start'] - 1] == '\n')
@@ -1067,7 +1078,10 @@ class ScratchpadPanel:
                 if self.inspector.pane == 'preview':
                     self.inspector.event(event, value, self.open_url)
                     return
-                self.finish_inspection()
+                # Cancel the inspection: close without saving any navigated-to
+                # page over the block's original page, so the inspector restores
+                # to the original location it was opened at.
+                self.inspector.close()
                 return
             if event == 'click':
                 x, y = value
@@ -1232,6 +1246,9 @@ class ScratchpadPanel:
             if inspect is not None:
                 if not self._can_interact(inspect):
                     self.message = f'Inspector owned by {inspect.get("owner_user_id")}; not interactable.'
+                    return
+                if not inspect.get('page'):
+                    self.message = 'Inspector is still loading.'
                     return
                 self.reveal(inspect['start'], inspect['end'])
                 self.graph_focus = None
@@ -1497,12 +1514,16 @@ class ScratchpadPanel:
         self.measure_cache[key] = (count, used)
         return count, used
 
-    def draw(self, cols, rows, wrap, styles, top=1, _settled=False):
+    def draw(self, cols, rows, wrap, styles, top=1):
         self.hit_rows = {}
         self.zones = []
         self.raw_lines = set()
-        _visible_cache = {}
-        _cells_cache = {}
+        if self._draw_text_version != self.text_version:
+            self._visible_cache = {}
+            self._cells_cache = {}
+            self._physical_cache = None
+            self._numbers_cache = None
+            self._draw_text_version = self.text_version
         if cols <= 0 or rows <= top:
             return ''
         if self.graph_focus is not None:
@@ -1650,10 +1671,10 @@ class ScratchpadPanel:
                 safe, mapping = '', []
             else:
                 key = (line, position)
-                cached = _visible_cache.get(key)
+                cached = self._visible_cache.get(key)
                 if cached is None:
                     cached = self._visible(line, position)
-                    _visible_cache[key] = cached
+                    self._visible_cache[key] = cached
                 safe, mapping = cached
             links = []
             for match in LINK.finditer(line if visible else ''):
@@ -1669,10 +1690,10 @@ class ScratchpadPanel:
                 chunks, display_map = [], []
             elif raw:
                 chunks, chunk, used = [], '', 0
-                cell_list = _cells_cache.get(safe)
+                cell_list = self._cells_cache.get(safe)
                 if cell_list is None:
                     cell_list = list(self.cells(safe))
-                    _cells_cache[safe] = cell_list
+                    self._cells_cache[safe] = cell_list
                 for unit, first, last in cell_list:
                     size = last - first + 1
                     if used and used + size > width:
@@ -1717,10 +1738,10 @@ class ScratchpadPanel:
                     if SGR.fullmatch(token):
                         style = token if token == '\033[0m' else style + token
                         continue
-                    cell_list = _cells_cache.get(token)
+                    cell_list = self._cells_cache.get(token)
                     if cell_list is None:
                         cell_list = list(self.cells(token))
-                        _cells_cache[token] = cell_list
+                        self._cells_cache[token] = cell_list
                     for unit, first, last in cell_list:
                         size = last - first + 1
                         source = local_map[index:index + len(unit)]
@@ -1774,8 +1795,6 @@ class ScratchpadPanel:
             self.offset = max(0, cursor_row if cursor_row < self.offset
                               else cursor_row - self.height + 1)
         self.offset = min(self.offset, self.max_offset)
-        if self.offset != viewport_start and not _settled:
-            return self.draw(cols, rows, wrap, styles, top, _settled=True)
         window = physical[self.offset:self.offset + self.height]
         for index, (value, left, right, spans, links) in enumerate(window):
             row = first_row + index

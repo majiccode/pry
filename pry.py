@@ -2671,10 +2671,6 @@ def handle_inline_event(event, value):
         if cursor >= view['offset'] + height:
             view['offset'] = cursor - height + 1
         row = view.get('content_row', 0) + cursor
-        if row < scroll_top_index:
-            scroll_top_index = row
-        elif row >= scroll_top_index + viewport_rows:
-            scroll_top_index = max(0, row - viewport_rows + 1)
         follow_output = False
         return True
     action = None
@@ -3978,6 +3974,16 @@ def main():
                 x, y = value
                 if (y, x) not in inline_screen_regions:
                     inline_focus = None
+                elif inline_focus is None:
+                    # Clicking an inspector control after Escape re-attaches focus.
+                    turn_index = inline_screen_regions[(y, x)]
+                    if 0 <= turn_index < len(session_history):
+                        item = session_history[turn_index]
+                        if item.get('interactive'):
+                            inline_focus = item.get('token')
+                            inline_control = 'focus'
+                            conversation.inspector_token = item.get('token') if conversation else None
+                            follow_output = False
             if inline_focus is None and handle_completion_event(event, value):
                 redraw_screen()
                 continue
