@@ -1323,8 +1323,7 @@ def handle_workspace_tab(event, value):
         if git_panel.capture_job is not None:
             git_panel.message = 'Capture running | Ctrl+C cancel before leaving Notes'
             return True
-        if git_panel.dirty:
-            git_panel.save()
+        git_panel.save_current()
         if git_panel.dirty or not git_panel.save_position():
             status_message = git_panel.message
             return True

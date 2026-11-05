@@ -88,19 +88,35 @@ class ScratchpadPanel:
         self.shared_text = ''
         self.private_text = self.text
         self.network_versions = {}
-        self.discover_results = {}
-        self.discovering = False
         self._last_synced_text = None
         self.shared_path = self.path.parent / 'shared.md'
         try:
             self.shared_text = self.shared_path.read_text(encoding='utf-8')
         except OSError:
             self.shared_text = ''
-        if self.network:
-            self.network.set_pending_text(self.shared_text)
+        self.shared_host = DEFAULT_PEER_HOST
+        self.shared_port = DEFAULT_PEER_PORT
+        self.network_role = 'client'
+        self.field = None
+        self.field_buffer = ''
+        self.field_fresh = False
         try:
             position = load_state(self.state_path).get('scratchpad', {})
             if isinstance(position, dict):
+                if isinstance(position.get('shared'), dict):
+                    shared = position['shared']
+                    host = shared.get('host')
+                    if isinstance(host, str) and host.strip():
+                        self.shared_host = host.strip()
+                    port = shared.get('port')
+                    if isinstance(port, int) and 0 <= port <= 65535:
+                        self.shared_port = port
+                    if shared.get('role') in ('client', 'server'):
+                        self.network_role = shared['role']
+                if position.get('mode') == 'shared':
+                    self.mode = 'shared'
+                    self.message = 'Shared network notes'
+                    self.text = self.shared_text
                 if position.get('fold_digest') == hashlib.sha256(self.text.encode()).hexdigest():
                     self.inspector.blocks = [b for b in position.get('inspectors', [])
                                              if isinstance(b, dict) and type(b.get('start')) is int
@@ -127,6 +143,13 @@ class ScratchpadPanel:
                     self.follow = False
         except (OSError, ValueError) as exc:
             self.message = f'Could not restore scratchpad position: {exc}'
+        if self.network:
+            self.network.set_pending_text(self.shared_text)
+        self.cursor = min(self.cursor, len(self.text))
+        if self.mode == 'shared':
+            # Returning to the panel in shared mode keeps the connection alive:
+            # attempt one connect with the saved settings.
+            self.connect_shared()
 
     def save_position(self):
         try:
@@ -134,9 +157,12 @@ class ScratchpadPanel:
                        {'cursor': self.cursor, 'offset': self.offset,
                           'graphs': self.graph_values,
                           'inspectors': self.inspector.blocks,
-                         'fold_digest': hashlib.sha256(self.text.encode()).hexdigest(),
-                         'collapsed_sections': sorted(self.collapsed_sections),
-                         'paste_blocks': self.paste_blocks})
+                          'mode': self.mode,
+                          'shared': {'host': self.shared_host, 'port': self.shared_port,
+                                     'role': self.network_role},
+                          'fold_digest': hashlib.sha256(self.text.encode()).hexdigest(),
+                          'collapsed_sections': sorted(self.collapsed_sections),
+                          'paste_blocks': self.paste_blocks})
             return True
         except (OSError, ValueError) as exc:
             self.message = f'Could not save scratchpad position: {exc}'
@@ -184,8 +210,20 @@ class ScratchpadPanel:
     def _save_shared(self):
         try:
             self.shared_path.write_text(self.text, encoding='utf-8')
+            self.dirty = False
         except OSError as exc:
             self.message = f'Shared notes not saved: {exc}'
+
+    def save_current(self):
+        """Persist the active pane's edits to its own file.
+
+        Shared edits must never be written to the private notes.md; each mode
+        flushes to its dedicated store.
+        """
+        if self.mode == 'shared':
+            self._save_shared()
+        else:
+            self.save()
 
     def apply_remote(self, text, version, peer_id=None):
         try:
@@ -193,6 +231,9 @@ class ScratchpadPanel:
         except (TypeError, ValueError):
             return
         if version <= self.network_versions.get(peer_id, -1):
+            return
+        if not str(text).strip() and self.shared_text.strip():
+            # Refuse an empty wipe: a peer starting up must not erase our notes.
             return
         self.network_versions[peer_id] = version
         self.shared_text = text
@@ -253,17 +294,40 @@ class ScratchpadPanel:
                     kind, payload = self.network.events.get_nowait()
                 except queue.Empty:
                     break
-                if kind == 'peer_discovered':
-                    self.discover_results[payload['id']] = payload
+                if kind == 'connect_result':
+                    host, port = payload.get('host'), payload.get('port')
+                    endpoint = f'{host}:{port}'
+                    if payload.get('success'):
+                        self.message = f'Connected to {endpoint}'
+                    elif self.mode == 'shared':
+                        self.message = f'No server found at {endpoint}'
                     changed = True
-                elif kind == 'peer_connected':
-                    self.message = f'Connected to {payload.get("name", "peer")}'
+                elif kind == 'discover_started':
+                    self.message = (f'Discovering {payload.get("count", 0)} addresses '
+                                    f'on port {payload.get("port")}…')
+                    changed = True
+                elif kind == 'discover_done':
+                    found = payload.get('found', [])
+                    port = payload.get('port')
+                    if found:
+                        extra = f' (+{len(found) - 1} more)' if len(found) > 1 else ''
+                        self.message = f'Found shared notes on {found[0]}{extra}; connecting as client…'
+                        self.shared_host = found[0]
+                        self.shared_port = port
+                        self.network_role = 'client'
+                        self.save_position()
+                        self.connect_shared()
+                    else:
+                        self.message = f'No shared notes server found on port {port}'
                     changed = True
                 elif kind == 'peer_disconnected':
                     self.message = 'Peer disconnected'
+                    self.network_versions.pop(payload if isinstance(payload, str) else None, None)
                     changed = True
                 elif kind == 'sync':
                     self.apply_remote(payload.get('text', ''), payload.get('version', 0), payload.get('id'))
+                    # Cache peer notes on disk, outside the private store.
+                    self._save_shared()
                     changed = True
         return changed
 
@@ -341,12 +405,12 @@ class ScratchpadPanel:
         self.zones = []
         if self.mode != 'shared':
             self.save()
-        elif self.network:
-            if self.text != self._last_synced_text:
+        else:
+            if self.network and self.text != self._last_synced_text:
                 self._last_synced_text = self.text
                 self.network.set_pending_text(self.text)
                 self.network.send_sync()
-                self._save_shared()
+            self._save_shared()
 
     def snapshot(self):
         return (self.text, self.cursor, self.selection, self.title,
@@ -738,6 +802,113 @@ class ScratchpadPanel:
         self.inspector.open(block, index=index)
         self.follow = True
 
+    def _commit_field(self):
+        """Commit the shared host/port edit box; False keeps editing on bad input."""
+        if self.field is None:
+            return True
+        kind, buffer = self.field, self.field_buffer
+        value = ''.join(c for c in buffer if c.isprintable()).strip()
+        if kind == 'host':
+            self.shared_host = value or DEFAULT_PEER_HOST
+        else:
+            if value and not value.isdigit():
+                self.message = 'Port must be a number'
+                return False
+            port = int(value) if value else DEFAULT_PEER_PORT
+            if not 1 <= port <= 65535:
+                self.message = 'Port must be between 1 and 65535'
+                return False
+            self.shared_port = port
+        self.field = None
+        self.field_buffer = ''
+        return True
+
+    def connect_shared(self):
+        """Act on the current role with the saved host/port."""
+        if self.network is None:
+            self.message = 'Network notes not available'
+            return
+        host, port = self.shared_host, self.shared_port
+        peer_id = f'{host}:{port}'
+        if self.network_role == 'server':
+            if self.network.start_server(port):
+                self.message = f'Sharing as server on port {self.network.tcp_port}'
+            else:
+                self.message = f'Port {port} is already in use by another process'
+            return
+        if self.network.has_connection():
+            self.message = f'Connected to {peer_id}'
+            return
+        self.network.ensure_started()
+        self.message = f'Connecting to {peer_id}…'
+        self.network.connect_async(peer_id, host, port, name=host)
+
+    HOST_SLOT = 18
+    PORT_SLOT = 6
+
+    def _field_slot(self, value, editing, width):
+        """Fixed-width displayable text so the row layout never shifts."""
+        caret = '\u258d' if editing else ''
+        pieces, used = [], 0
+        limit = width - (sum(last - first + 1 for _, first, last in self.cells(caret)) if caret else 0)
+        for unit, first, last in self.cells(value):
+            size = last - first + 1
+            if used + size > limit:
+                break
+            pieces.append(unit)
+            used += size
+        if caret:
+            pieces.append(caret)
+            used += sum(last - first + 1 for _, first, last in self.cells(caret))
+        return ''.join(pieces) + ' ' * (width - used)
+
+    def shared_header_segments(self):
+        """[host] [port] [Server] [Client] [Discover] row, with click zones."""
+        host_value = self.field_buffer if self.field == 'host' else self.shared_host
+        port_value = self.field_buffer if self.field == 'port' else str(self.shared_port)
+        server_mark = '▸' if self.network_role == 'server' else ' '
+        client_mark = '▸' if self.network_role == 'client' else ' '
+        state = 'Not connected'
+        if self.network is not None:
+            if self.network_role == 'server':
+                if self.network._running.is_set():
+                    state = f'Server on port {self.network.tcp_port}'
+            elif self.network.has_connection():
+                state = 'Connected'
+        return [('  Host ', 'field_host', None),
+                (self._field_slot(host_value, self.field == 'host', self.HOST_SLOT),
+                 'field_host', None),
+                ('   Port ', 'field_port', None),
+                (self._field_slot(port_value, self.field == 'port', self.PORT_SLOT),
+                 'field_port', None),
+                (f'   [{server_mark}Server] ', 'btn_server', None),
+                (f'[{client_mark}Client] ', 'btn_client', None),
+                ('[Discover] ', 'btn_discover', None),
+                ('  ' + state, None, None)]
+
+    def switch_mode(self, target):
+        if target == self.mode or target not in ('private', 'shared'):
+            return
+        self._commit_field()
+        self.field = None
+        self.field_buffer = ''
+        self.field_fresh = False
+        if self.mode == 'private':
+            self.private_text = self.text
+        else:
+            self.shared_text = self.text
+        self.mode = target
+        self.text = self.private_text if target == 'private' else self.shared_text
+        self.paste_blocks = []
+        self.cursor = min(self.cursor, len(self.text))
+        self.selection = self.anchor = None
+        self.follow = True
+        if target == 'shared':
+            self.connect_shared()
+        else:
+            self.message = 'Private notes'
+        self.save_position()
+
     def event(self, event, value):
         if event == 'function' and value == 1:
             self.toggle_inspector()
@@ -808,40 +979,88 @@ class ScratchpadPanel:
             if block:
                 self.open_graph(block[3], block[4])
             return
+        if self.mode == 'shared' and self.field is not None:
+            if event == 'escape' or event == 'key' and value == '\x1b':
+                self.field = None
+                self.field_buffer = ''
+                self.field_fresh = False
+                self.message = 'Shared host/port unchanged'
+            elif event == 'newline' or event == 'key' and value in ('\r', '\n'):
+                if self.field_fresh:
+                    # Enter on an untouched pre-filled box keeps the current value.
+                    self.field_fresh = False
+                if self._commit_field():
+                    self.connect_shared()
+                    self.save_position()
+            elif event == 'key' and value in ('\x7f', '\x08'):
+                self.field_buffer = '' if self.field_fresh else self.field_buffer[:-1]
+                self.field_fresh = False
+            elif event == 'key' and value == '\x15':
+                self.field_buffer = ''
+                self.field_fresh = False
+            elif event == 'paste':
+                if self.field_fresh:
+                    self.field_buffer = ''
+                    self.field_fresh = False
+                self.field_buffer += ''.join(c for c in str(value or '') if c.isprintable())
+            elif event == 'key' and isinstance(value, str) and value.isprintable():
+                if self.field_fresh:
+                    self.field_buffer = ''
+                    self.field_fresh = False
+                self.field_buffer = (self.field_buffer + value)[:120]
+            return
         if event == 'click':
             x, y = value
+            clickable = ('tab_private', 'tab_shared', 'field_host', 'field_port',
+                         'btn_server', 'btn_client', 'btn_discover')
             tab_hit = next((action for row, left, right, action, arg in self.zones
                             if row == y and left <= x <= right
-                            and action in ('tab_private', 'tab_shared', 'discover')), None)
+                            and action in clickable), None)
+            if tab_hit == 'field_host':
+                self._commit_field()
+                self.field = 'host'
+                self.field_buffer = self.shared_host
+                self.field_fresh = True
+                self.message = 'Editing host | type to replace, Enter commit, Esc cancel, Ctrl+U clear'
+                return
+            if tab_hit == 'field_port':
+                self._commit_field()
+                self.field = 'port'
+                self.field_buffer = str(self.shared_port)
+                self.field_fresh = True
+                self.message = 'Editing port | type to replace, Enter commit, Esc cancel, Ctrl+U clear'
+                return
+            if tab_hit == 'btn_server':
+                self._commit_field()
+                self.network_role = 'server'
+                self.connect_shared()
+                self.save_position()
+                return
+            if tab_hit == 'btn_client':
+                self._commit_field()
+                self.network_role = 'client'
+                self.connect_shared()
+                self.save_position()
+                return
+            if tab_hit == 'btn_discover':
+                self._commit_field()
+                self.network_role = 'client'
+                if self.network is None:
+                    self.message = 'Network notes not available'
+                elif self.network.discover(self.shared_port):
+                    self.message = f'Discovering local network on port {self.shared_port}…'
+                else:
+                    self.message = 'Discovery already running'
+                self.save_position()
+                return
             if tab_hit == 'tab_private':
-                self.shared_text = self.text
-                self.mode = 'private'
-                self.text = self.private_text
-                self.paste_blocks = []
-                self.cursor = min(self.cursor, len(self.text))
-                self.selection = self.anchor = None
-                self.follow = True
-                self.message = 'Private notes'
+                self.switch_mode('private')
                 return
             if tab_hit == 'tab_shared':
-                self.private_text = self.text
-                self.mode = 'shared'
-                self.text = self.shared_text
-                self.paste_blocks = []
-                self.cursor = min(self.cursor, len(self.text))
-                self.selection = self.anchor = None
-                self.follow = True
-                self.message = 'Shared network notes (click Discover to connect)'
+                self.switch_mode('shared')
                 return
-            if tab_hit == 'discover':
-                if self.network:
-                    if not self.network._running.is_set():
-                        self.network.start()
-                    self.discover_results = self.network.list_peers()
-                    port = self.network.tcp_port
-                    self.message = f'Listening on port {port} | /connect host:port to join a peer'
-                self.discovering = True
-                return
+            if self.field is not None:
+                self._commit_field()
             inspect = next((arg for row, left, right, action, arg in self.zones
                             if row == y and left <= x <= right and action == 'inspect'), None)
             if inspect is not None:
@@ -880,7 +1099,7 @@ class ScratchpadPanel:
                 self.selection = self.anchor = None
                 return
             if self.dirty:
-                self.save()
+                self.save_current()
             if not self.dirty and self.save_position():
                 return 'close', ''
             return
@@ -896,7 +1115,7 @@ class ScratchpadPanel:
                 self.message = f'Paste failed: {exc}'
             return
         if event == 'key' and value == '\x13':
-            self.save()
+            self.save_current()
             return
         if event == 'key' and value in ('\x1a', '\x19'):
             source, destination = (self.undo, self.redo) if value == '\x1a' else (self.redo, self.undo)
@@ -916,7 +1135,7 @@ class ScratchpadPanel:
                 self.dirty = self.follow = True
                 self.hit_rows = {}
                 self.zones = []
-                self.save()
+                self.save_current()
                 self.save_position()
             return
         start = self.text.rfind('\n', 0, self.cursor) + 1
@@ -955,14 +1174,13 @@ class ScratchpadPanel:
                         except ValueError:
                             self.message = 'Invalid port'
                         else:
-                            if not self.network._running.is_set():
-                                self.network.start()
-                            peer_id = f'{host}:{port}'
-                            self.network.add_peer(peer_id, host, port, name=host)
-                            if self.network.connect(peer_id):
-                                self.message = f'Connecting to {host}:{port}…'
+                            if not 1 <= port <= 65535:
+                                self.message = 'Port must be between 1 and 65535'
                             else:
-                                self.message = f'Failed to connect to {host}:{port}'
+                                self.network_role = 'client'
+                                self.shared_host, self.shared_port = host, port
+                                self.connect_shared()
+                                self.save_position()
             else:
                 self.insert('\n')
         elif event == 'paste':
@@ -1130,22 +1348,41 @@ class ScratchpadPanel:
         put(top + 1, 1, ' Scratchpad / notes.md | Tab AI chat', cols, ACCENT)
         priv_mark = '▸' if self.mode == 'private' else ' '
         shar_mark = '▸' if self.mode == 'shared' else ' '
-        tab_line = f'  [{priv_mark}Private] [{shar_mark}Shared] [Discover]'
+        tab_line = f'  [{priv_mark}Private] [{shar_mark}Shared]'
         put(top + 2, 1, tab_line, cols, MUTED)
         self.zones.append((top + 2, 3, 12, 'tab_private', None))
         self.zones.append((top + 2, 14, 22, 'tab_shared', None))
-        self.zones.append((top + 2, 24, 33, 'discover', None))
         hint_cols = cols - len(tab_line) - 2
         if hint_cols > 40:
             hint = f' | F1 inspect | Ctrl+E fold | Ctrl+C/X/V clipboard | click tabs | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find'
             put(top + 2, len(tab_line) + 2, hint, cols, MUTED)
         elif hint_cols > 10:
-            hint = f' | 1/2 tab | d discover'
+            hint = f' | 1/2 tab | click host/port'
             put(top + 2, len(tab_line) + 2, hint, cols, MUTED)
-        width, origin = max(1, cols - 4), 4 if cols > 4 else 1
-        viewport_height = max(1, rows - (top + 3))
+        first_row = top + 3
+        if self.mode == 'shared':
+            first_row = top + 4
+            column = 1
+            for text, action, arg in self.shared_header_segments():
+                span = sum(last - first + 1 for _, first, last in self.cells(text))
+                put(top + 3, column, text, cols - column + 1,
+                    ACCENT if action and action == self.field else MUTED)
+                if action:
+                    self.zones.append((top + 3, column, column + span - 1, action, arg))
+                column += span
+        digits = max(1, len(str(self.text.count('\n') + 1)))
+        gutter = digits + 4 if cols >= digits + 18 else 0
+        origin = gutter or (4 if cols > 4 else 1)
+        width = max(1, cols - origin)
+        viewport_height = max(1, rows - first_row)
         viewport_start = self.offset
         physical = []
+        numbers = []
+        current_number = [None]
+
+        def add_row(styled, left, right, spans, links):
+            physical.append((styled, left, right, spans, links))
+            numbers.append(current_number[0])
         cursor_row = cursor_col = 0
         position, fence = 0, None
         blocks = {block[2]: block for block in self.graph_blocks()}
@@ -1161,7 +1398,9 @@ class ScratchpadPanel:
         if self.search.active:
             hits = [(self.search_offsets[i] + left, self.search_offsets[i] + right)
                     for i, left, right in self.search.matches]
-        for line in self.text.split('\n'):
+        for line_no, line in enumerate(self.text.split('\n')):
+            number = line_no + 1
+            current_number[0] = None
             end = position + len(line)
             for inspector in self.inspector.blocks:
                 boundary = inspector_bounds[inspector['id']]
@@ -1171,8 +1410,8 @@ class ScratchpadPanel:
                 if any(b['kind'] == 'section' and b['body'] <= position < b['end'] for b in hidden):
                     continue
                 inspector_rows[len(physical)] = ('inspect', inspector)
-                physical.append((ACCENT + '[ Inspect · ' + self._visible(inspector['page'].get('title', ''), 0)[0] + ' ]',
-                                 position, position, [], []))
+                add_row(ACCENT + '[ Inspect · ' + self._visible(inspector['page'].get('title', ''), 0)[0] + ' ]',
+                        position, position, [], [])
                 if self.inspector.focus is inspector:
                     inspect_visible = (len(physical) < viewport_start + viewport_height
                                        and len(physical) + max(8, rows - top - 7) > viewport_start)
@@ -1192,7 +1431,7 @@ class ScratchpadPanel:
                             styled = ACCENT + plain[:split] + SELECTED + plain[split:] + BASE
                         else:
                             styled = ACCENT + plain
-                        physical.append((styled, position, position, [], []))
+                        add_row(styled, position, position, [], [])
             focused_boundary = inspector_bounds.get((self.inspector.focus or {}).get('id'))
             if focused_boundary and focused_boundary[1] <= position < focused_boundary[2]:
                 position = end + 1
@@ -1207,7 +1446,7 @@ class ScratchpadPanel:
                     summary = covering['label'] + f' … ({count} lines)'
                     safe_summary, _ = self._visible(summary, 0)
                     summary_visible = viewport_start <= len(physical) < viewport_start + viewport_height
-                    physical.append((MUTED + wrap(safe_summary, width)[0] if summary_visible else '', position, position, [], []))
+                    add_row(MUTED + wrap(safe_summary, width)[0] if summary_visible else '', position, position, [], [])
                     if position <= self.cursor < covering['end']:
                         cursor_row, cursor_col = len(physical) - 1, 0
                 position = end + 1
@@ -1232,7 +1471,9 @@ class ScratchpadPanel:
                 if self.cursor == end and raw and used == width:
                     cursor_row = len(physical) + count - 1
             if not visible:
-                physical.extend(('', position, end, [], []) for _ in range(count))
+                current_number[0] = number
+                for _ in range(count):
+                    add_row('', position, end, [], [])
                 safe, mapping = '', []
             else:
                 key = (line, position)
@@ -1287,6 +1528,7 @@ class ScratchpadPanel:
                     else:
                         display_map[i] = neighbor
             consumed = 0
+            current_number[0] = number
             for chunk in chunks:
                 spans, styled, column, style = [], '', 0, BASE + TEXT
                 plain = SGR.sub('', chunk)
@@ -1321,7 +1563,8 @@ class ScratchpadPanel:
                         column += size
                         index += len(source)
                 consumed += len(plain)
-                physical.append((styled + BASE, left, right, spans, links))
+                add_row(styled + BASE, left, right, spans, links)
+                current_number[0] = None
             if marker:
                 if fence is None:
                     fence = marker[1]
@@ -1329,6 +1572,7 @@ class ScratchpadPanel:
                 elif marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
                     fence = None
                     json_fence = False
+            current_number[0] = None
             if end in blocks:
                 _, _, _, key, source = blocks[end]
                 graph = self.graph(key, source)
@@ -1338,14 +1582,13 @@ class ScratchpadPanel:
                         preview = self.graph_preview(key, graph, width, plot_index) if plot_visible else [''] * 10
                         for rendered in preview:
                             graph_rows[len(physical)] = (key, source, plot_index)
-                            physical.append((rendered, end, end, [], []))
+                            add_row(rendered, end, end, [], [])
                         graph_rows[len(physical)] = (key, source, plot_index)
-                        physical.append((MUTED + ' Click graph to expand / adjust sliders | Ctrl+G from source' + BASE,
-                                         end, end, [], []))
+                        add_row(MUTED + ' Click graph to expand / adjust sliders | Ctrl+G from source' + BASE,
+                                end, end, [], [])
                 else:
-                    physical.append((ERROR + 'Graph: ' + graph + BASE, end, end, [], []))
+                    add_row(ERROR + 'Graph: ' + graph + BASE, end, end, [], [])
             position = end + 1
-        first_row = top + 3
         if self.inspector.focus is not None:
             cursor_row = next((i + 1 for i, (action, block) in inspector_rows.items()
                                if action == 'inspect' and block is self.inspector.focus), cursor_row)
@@ -1360,10 +1603,13 @@ class ScratchpadPanel:
         self.offset = min(self.offset, self.max_offset)
         if self.offset != viewport_start and not _settled:
             return self.draw(cols, rows, wrap, styles, top, _settled=True)
-        for index, (value, left, right, spans, links) in enumerate(physical[self.offset:self.offset + self.height]):
+        window = physical[self.offset:self.offset + self.height]
+        for index, (value, left, right, spans, links) in enumerate(window):
             row = first_row + index
             if not top < row < rows:
                 continue
+            if gutter and numbers[self.offset + index]:
+                put(row, 1, f'{numbers[self.offset + index]:>{digits}}', digits, MUTED)
             put(row, origin, value, width)
             inspect = inspector_rows.get(self.offset + index)
             if inspect is not None:

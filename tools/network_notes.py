@@ -13,6 +13,7 @@ import select
 import socket
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
 TCP_LISTEN_BACKLOG = 8
@@ -41,36 +42,77 @@ class NetworkNotes:
         self._threads = []
         self._server = None
         self._sender_thread = None
+        self._sender_token = None
+        self._discovering = threading.Event()
 
     # -- lifecycle -----------------------------------------------------
-    def start(self):
-        if self._started:
-            return self.id, self.tcp_port
-        self._started = True
-        self._running.set()
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self._server.bind(('0.0.0.0', DEFAULT_PEER_PORT))
-            self.tcp_port = DEFAULT_PEER_PORT
-        except OSError:
-            self._server.bind(('0.0.0.0', 0))
-            self.tcp_port = self._server.getsockname()[1]
-        self._server.listen(TCP_LISTEN_BACKLOG)
-        self._server.setblocking(False)
-        self._threads.append(threading.Thread(target=self._tcp_accept,
-                                              daemon=True, name='nn-tcp-accept'))
-        self._sender_thread = threading.Thread(target=self._sender_loop,
+    def _spin_threads(self):
+        if self._server is not None:
+            self._server.listen(TCP_LISTEN_BACKLOG)
+            self._server.setblocking(False)
+            self._threads.append(threading.Thread(target=self._tcp_accept, args=(self._server,),
+                                                  daemon=True, name='nn-tcp-accept'))
+        token = object()
+        self._sender_token = token
+        self._sender_thread = threading.Thread(target=self._sender_loop, args=(token,),
                                                daemon=True, name='nn-sender')
         self._sender_thread.start()
         for thread in self._threads:
             thread.start()
-        return self.id, self.tcp_port
+
+    def ensure_started(self):
+        """Prepare client-side sync I/O (no listener) if not running yet."""
+        if self._running.is_set():
+            return True
+        self.start()
+        return True
+
+    def start(self, port=None):
+        """Start sync I/O. With `port` (server role) also listen on that port;
+        without it, run as a pure client (connections are opened by us)."""
+        if self._started:
+            return True
+        self._started = True
+        self._running.set()
+        self._server = None
+        self.tcp_port = 0
+        if port is not None:
+            self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self._server.bind(('0.0.0.0', port))
+                self.tcp_port = port
+            except OSError:
+                self._server.bind(('0.0.0.0', 0))
+                self.tcp_port = self._server.getsockname()[1]
+        self._spin_threads()
+        return True
+
+    def start_server(self, port=0):
+        """Become the server on an explicit port; False when the port is taken.
+
+        Restarting on a different port while running is supported.
+        """
+        if self._running.is_set():
+            if self._server is not None and (not port or self.tcp_port == port):
+                return True
+            self.stop()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(('0.0.0.0', port))
+        except OSError:
+            return False
+        finally:
+            probe.close()
+        self.start(port=port)
+        return True
 
     def stop(self):
         self._running.clear()
         self._started = False
         self._cancel_debounce()
+        self._sender_token = None
         with self._lock:
             for peer_id, sock in list(self.connections.items()):
                 try:
@@ -78,11 +120,12 @@ class NetworkNotes:
                 except OSError:
                     pass
             self.connections.clear()
-        if self._server:
+        if self._server is not None:
             try:
                 self._server.close()
             except OSError:
                 pass
+            self._server = None
         for thread in self._threads:
             try:
                 thread.join(timeout=1.0)
@@ -115,17 +158,27 @@ class NetworkNotes:
         with self._lock:
             return {pid: dict(p) for pid, p in self.peers.items()}
 
+    def has_connection(self):
+        with self._lock:
+            return bool(self.connections)
+
+    def connected_endpoints(self):
+        with self._lock:
+            return sorted(self.connections)
+
     # -- TCP -----------------------------------------------------------
-    def _tcp_accept(self):
+    def _tcp_accept(self, server=None):
+        if server is None:
+            return
         while self._running.is_set():
             try:
-                ready, _, _ = select.select([self._server], [], [], 0.2)
+                ready, _, _ = select.select([server], [], [], 0.2)
             except (OSError, ValueError):
                 return
             if not ready:
                 continue
             try:
-                conn, _addr = self._server.accept()
+                conn, _addr = server.accept()
             except OSError:
                 continue
             conn.settimeout(SOCKET_TIMEOUT)
@@ -165,6 +218,10 @@ class NetworkNotes:
                         if peer_id:
                             self.connections[peer_id] = conn
                     self.events.put(('sync', msg))
+                    if peer_id and old is None and self._pending_text:
+                        # Greet a new accepted peer with our current notes; the
+                        # client's own (possibly empty) initial push cannot win.
+                        self.send_sync(force=True)
         finally:
             if peer_id:
                 with self._lock:
@@ -176,7 +233,7 @@ class NetworkNotes:
             except OSError:
                 pass
 
-    def connect(self, peer_id):
+    def connect(self, peer_id, timeout=SOCKET_TIMEOUT):
         with self._lock:
             if peer_id in self.connections:
                 return True
@@ -186,7 +243,7 @@ class NetworkNotes:
             host = peer['host']
             port = peer['port']
         try:
-            conn = socket.create_connection((host, port), timeout=SOCKET_TIMEOUT)
+            conn = socket.create_connection((host, port), timeout=timeout)
         except OSError:
             return False
         conn.settimeout(SOCKET_TIMEOUT)
@@ -195,6 +252,87 @@ class NetworkNotes:
         with self._lock:
             self.connections[peer_id] = conn
         self.send_sync(force=True)
+        return True
+
+    def connect_async(self, peer_id, host, port, name=None, timeout=3.0):
+        """Connect on a worker thread; posts ('connect_result', payload) either way."""
+        self.ensure_started()
+        self.add_peer(peer_id, host, port, name=name)
+        if peer_id in self.connected_endpoints():
+            self.events.put(('connect_result',
+                             {'id': peer_id, 'host': host, 'port': port, 'success': True}))
+            return
+        def worker():
+            try:
+                conn = socket.create_connection((host, port), timeout=timeout)
+            except OSError:
+                self.events.put(('connect_result',
+                                 {'id': peer_id, 'host': host, 'port': port, 'success': False}))
+                return
+            conn.settimeout(SOCKET_TIMEOUT)
+            threading.Thread(target=self._tcp_recv, args=(conn,),
+                             daemon=True, name='nn-tcp-recv').start()
+            with self._lock:
+                self.connections[peer_id] = conn
+            if self._pending_text:
+                # Only push non-empty content; an empty node should not erase peers.
+                self.send_sync(force=True)
+            self.events.put(('connect_result',
+                             {'id': peer_id, 'host': host, 'port': port, 'success': True}))
+        threading.Thread(target=worker, daemon=True, name='nn-tcp-connect').start()
+
+    # -- discovery -----------------------------------------------------
+    def local_addresses(self):
+        """(own address, candidates) for the primary interface's /24 subnet."""
+        own = None
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(('1.1.1.1', 9))  # no packets sent; picks the route source
+            own = probe.getsockname()[0]
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        if not own or own.startswith('127.'):
+            try:
+                own = socket.gethostbyname(socket.gethostname())
+            except OSError:
+                own = None
+        parts = (own or '').split('.')
+        if len(parts) != 4 or not all(p.isdigit() for p in parts):
+            return own or '', []
+        candidates = [p for p in (f'{".".join(parts[:3])}.{n}' for n in range(1, 255))
+                      if p != own]
+        return own, candidates
+
+    def discover(self, port=DEFAULT_PEER_PORT, timeout=0.25):
+        """Probe each /24 address for a Pry notes server; False when already scanning.
+
+        Posts ('discover_started', ...) then ('discover_done', {found: [hosts]}).
+        """
+        if self._discovering.is_set():
+            return False
+        self._discovering.set()
+        self.ensure_started()
+        def worker():
+            try:
+                own, candidates = self.local_addresses()
+                self.events.put(('discover_started',
+                                 {'count': len(candidates), 'port': port, 'own': own}))
+                found = []
+                def probe(address):
+                    try:
+                        sock = socket.create_connection((address, port), timeout=timeout)
+                        sock.close()
+                        return address
+                    except OSError:
+                        return None
+                with ThreadPoolExecutor(max_workers=32) as pool:
+                    found = [host for host in pool.map(probe, candidates) if host]
+                self.events.put(('discover_done', {'port': port, 'found': found}))
+            finally:
+                self._discovering.clear()
+        threading.Thread(target=worker, daemon=True, name='nn-discover').start()
         return True
 
     # -- sync ----------------------------------------------------------
@@ -236,8 +374,8 @@ class NetworkNotes:
             self._debounce_timer.daemon = True
             self._debounce_timer.start()
 
-    def _sender_loop(self):
-        while self._running.is_set():
+    def _sender_loop(self, token=None):
+        while token is self._sender_token and self._running.is_set():
             try:
                 peer_id, payload = self.outbound.get(timeout=0.2)
             except Empty:

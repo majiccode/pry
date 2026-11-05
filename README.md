@@ -271,7 +271,9 @@ Shift+Page Up/Down; Ctrl+Home/End moves to the document boundaries, with Shift
 extending the selection. Ctrl+C exits Pry; Ctrl+X cuts, and Ctrl+V pastes from
 the system clipboard. Your terminal's usual paste shortcut also works. Ctrl+Click
 an HTTP(S) URL or Markdown link to open it in your default browser, provided your
-terminal forwards modified mouse clicks to Pry.
+terminal forwards modified mouse clicks to Pry. Source line numbers appear in the
+left gutter when the window is wide enough, shown only on the first row of a line
+so wrapped text stays unnumbered.
 
 Typing or pasting replaces the editor selection; Backspace/Delete removes it.
 Copy and cut never select or copy the header, graph previews, or other panels.
