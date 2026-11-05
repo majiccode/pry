@@ -8,6 +8,7 @@ Peers are added manually via :meth:`add_peer` (host:port) -- there is no
 UDP broadcasting, so this will not flood WiFi networks.
 """
 
+import base64
 import json
 import select
 import socket
@@ -15,6 +16,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
+from pathlib import Path
 
 TCP_LISTEN_BACKLOG = 8
 SOCKET_TIMEOUT = 5.0
@@ -31,8 +33,10 @@ class NetworkNotes:
         self._lock = threading.Lock()
         self.peers = {}          # peer_id -> {name, host, port}
         self.connections = {}    # peer_id -> socket
+        self.user_id_to_peer = {}  # user_id -> peer_id
         self.events = Queue()    # (kind, payload) consumed by the UI thread
         self.outbound = Queue()  # (peer_id, bytes)
+        self.pending_file_requests = {}  # request_id -> (peer_id, path, callback)
         self._running = threading.Event()
         self._version = 0
         self._pending_text = ''
@@ -205,23 +209,30 @@ class NetworkNotes:
                         msg = json.loads(line.decode())
                     except (ValueError, UnicodeDecodeError):
                         continue
-                    if msg.get('type') != 'sync':
-                        continue
-                    peer_id = msg.get('id') or peer_id
-                    with self._lock:
-                        old = self.connections.get(peer_id)
-                        if old is not None and old is not conn:
-                            try:
-                                old.close()
-                            except OSError:
-                                pass
-                        if peer_id:
-                            self.connections[peer_id] = conn
-                    self.events.put(('sync', msg))
-                    if peer_id and old is None and self._pending_text:
-                        # Greet a new accepted peer with our current notes; the
-                        # client's own (possibly empty) initial push cannot win.
-                        self.send_sync(force=True)
+                    msg_type = msg.get('type')
+                    if msg_type == 'sync':
+                        sender_id = msg.get('id')
+                        if sender_id:
+                            self.user_id_to_peer[sender_id] = sender_id
+                        peer_id = sender_id or peer_id
+                        with self._lock:
+                            old = self.connections.get(peer_id)
+                            if old is not None and old is not conn:
+                                try:
+                                    old.close()
+                                except OSError:
+                                    pass
+                            if peer_id:
+                                self.connections[peer_id] = conn
+                        self.events.put(('sync', msg))
+                        if peer_id and old is None and self._pending_text:
+                            # Greet a new accepted peer with our current notes; the
+                            # client's own (possibly empty) initial push cannot win.
+                            self.send_sync(force=True)
+                    elif msg_type == 'file_request':
+                        self._handle_file_request(msg, conn)
+                    elif msg_type == 'file_response':
+                        self._handle_file_response(msg)
         finally:
             if peer_id:
                 with self._lock:
@@ -390,3 +401,71 @@ class NetworkNotes:
                 with self._lock:
                     self.connections.pop(peer_id, None)
                 self.events.put(('peer_disconnected', peer_id))
+
+    def get_peer_for_user(self, user_id):
+        """Return the peer_id (connection key) for a given user_id, if known."""
+        with self._lock:
+            return self.user_id_to_peer.get(user_id)
+
+    # -- file transfer ---------------------------------------------------
+    def request_file(self, peer_id, path, callback):
+        """Request a file from a peer. Calls callback(data, error) on the network thread."""
+        request_id = uuid.uuid4().hex[:8]
+        with self._lock:
+            self.pending_file_requests[request_id] = (peer_id, path, callback)
+        payload = (json.dumps({
+            'type': 'file_request', 'id': self.id, 'request_id': request_id, 'path': path,
+        }).encode() + b'\n')
+        with self._lock:
+            conn = self.connections.get(peer_id)
+        if conn is not None:
+            self.outbound.put((peer_id, payload))
+        else:
+            with self._lock:
+                self.pending_file_requests.pop(request_id, None)
+            callback(None, 'Not connected to peer')
+
+    def _handle_file_request(self, msg, conn):
+        sender_id = msg.get('id')
+        if sender_id:
+            self.user_id_to_peer[sender_id] = sender_id
+        path = msg.get('path')
+        request_id = msg.get('request_id')
+        peer_id = msg.get('id')
+        try:
+            data = Path(path).read_bytes()
+            encoded = base64.b64encode(data).decode('ascii')
+        except OSError as exc:
+            encoded = None
+            error = str(exc)
+        else:
+            error = None
+        response = (json.dumps({
+            'type': 'file_response', 'id': self.id, 'request_id': request_id,
+            'path': path, 'data': encoded, 'error': error,
+        }).encode() + b'\n')
+        with self._lock:
+            target = self.connections.get(peer_id)
+        if target is not None:
+            try:
+                target.sendall(response)
+            except OSError:
+                pass
+
+    def _handle_file_response(self, msg):
+        request_id = msg.get('request_id')
+        with self._lock:
+            pending = self.pending_file_requests.pop(request_id, None)
+        if pending is None:
+            return
+        peer_id, path, callback = pending
+        data = msg.get('data')
+        error = msg.get('error')
+        if data is not None:
+            try:
+                file_data = base64.b64decode(data)
+                callback(file_data, None)
+            except ValueError as exc:
+                callback(None, str(exc))
+        else:
+            callback(None, error or 'File unavailable')

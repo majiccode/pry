@@ -2,13 +2,19 @@
 from datetime import datetime
 from difflib import SequenceMatcher
 from copy import deepcopy
+import base64
 import hashlib
+import io
+import mimetypes
 import os
 import queue
+import shutil
+import socket
 from pathlib import Path
 import re
 import tempfile
 import threading
+from uuid import uuid4
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -31,12 +37,16 @@ LINK = re.compile(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>]+', re.
 
 class ScratchpadPanel:
     def __init__(self, path, cells, clipboard_copy=None, clipboard_paste=None, open_url=None,
-                 cwd=None, shell=None, timeout: float =120, network=None):
+                 cwd=None, shell=None, timeout: float =120, network=None, user_id=None,
+                 user_name=None):
         self.path = Path(path)
         self.cells = cells
         self.clipboard_copy = clipboard_copy
         self.clipboard_paste = clipboard_paste
         self.open_url = open_url if open_url is not None else webbrowser.open
+        self.network = network
+        self.user_id = user_id or (network.id if network is not None else uuid4().hex[:8])
+        self.user_name = user_name or (network.local_name if network is not None else socket.gethostname())
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -97,6 +107,8 @@ class ScratchpadPanel:
         self.shared_host = DEFAULT_PEER_HOST
         self.shared_port = DEFAULT_PEER_PORT
         self.network_role = 'client'
+        self.shared_files_dir = self.path.parent / 'shared_files'
+        self.shared_files_dir.mkdir(parents=True, exist_ok=True)
         self.field = None
         self.field_buffer = ''
         self.field_fresh = False
@@ -225,6 +237,22 @@ class ScratchpadPanel:
         else:
             self.save()
 
+    def _parse_file_source_fences(self, text):
+        """Find file source fences in text and return (start, end, metadata) tuples."""
+        fences = []
+        pattern = re.compile(r'```filesource\n(.*?)\n```', re.DOTALL)
+        for match in pattern.finditer(text):
+            block_text = match.group(1)
+            meta = {}
+            for line in block_text.splitlines():
+                if ':' in line:
+                    key, _, value = line.partition(':')
+                    meta[key.strip()] = value.strip()
+            start = match.start()
+            end = match.end()
+            fences.append((start, end, meta))
+        return fences
+
     def apply_remote(self, text, version, peer_id=None):
         try:
             version = int(version)
@@ -240,6 +268,24 @@ class ScratchpadPanel:
         if self.mode == 'shared':
             self.text = text
             self.paste_blocks = []
+            # Re-parse file source fences from the synced text so peers can
+            # retrieve shared files. Capture blocks are local-only and not synced.
+            self.inspector.blocks = []
+            for start, end, meta in self._parse_file_source_fences(text):
+                path = meta.get('path', '')
+                file_name = meta.get('file_name', Path(path).name if path else 'file')
+                mime = meta.get('mime', 'application/octet-stream')
+                is_image = meta.get('is_image', 'false') == 'true'
+                owner_id = meta.get('user_id', peer_id or '')
+                owner_name = meta.get('user_name', '')
+                entry_target = dict(kind='file_source', path=path,
+                                    user_id=owner_id, user_name=owner_name,
+                                    is_image=is_image)
+                page = dict(title=f'{file_name} · file source',
+                            entries=[dict(label='Open file', target=entry_target)])
+                self.inspector.add(start, end, f'file: {path}', '', path, 0,
+                                   owner_user_id=peer_id, block_type='file_source',
+                                   page=page)
             self.cursor = min(self.cursor, len(self.text))
             self.selection = self.anchor = None
             self.follow = True
@@ -273,6 +319,7 @@ class ScratchpadPanel:
                 output, details = '', f'Capture failed: {result}'
             fence = '`' * max(3, max((len(m[0]) + 1 for m in re.finditer(r'`+', output)), default=3))
             snapshot = (f"Captured: {self.capture_started}\nCommand: {job.command}\n"
+                        f"Captured by: {self.user_name} ({self.user_id})\n"
                         f"Working directory: {job.cwd}\n{details}\n\n{fence}text\n{output}"
                         + ('' if output.endswith('\n') else '\n') + f'{fence}\n')
             start, end = self.capture_range or (len(self.text), len(self.text))
@@ -285,7 +332,8 @@ class ScratchpadPanel:
             self.cursor = begin
             if kind == 'done' and not result.get('reason'):
                 self.inspector.add(begin, begin + len(snapshot), job.command, output,
-                                   result.get('cwd', job.cwd), result['exit_code'])
+                                   result.get('cwd', job.cwd), result['exit_code'],
+                                   owner_user_id=self.user_id, block_type='capture')
             self.save_position()
             changed = True
         if self.network:
@@ -473,9 +521,18 @@ class ScratchpadPanel:
         value = value.replace('\r\n', '\n').replace('\r', '\n').replace('\t', '    ')
         value = ''.join(c for c in value if c == '\n' or c.isprintable() or c == '\u200d')
         value = prepare_paste(value)
-        large = len(value) > 1000 or len(value.splitlines()) > 10
         if not value:
             return
+        # Detect a pasted file path: a single existing file becomes a file source block.
+        stripped = value.strip()
+        if '\n' not in stripped:
+            candidate = Path(stripped).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(self.cwd() if callable(self.cwd) else self.cwd) / candidate
+            if candidate.is_file() and not candidate.is_symlink():
+                self._paste_file_source(candidate)
+                return
+        large = len(value) > 1000 or len(value.splitlines()) > 10
         start, end = self.selection or (self.cursor, self.cursor)
         structured = large or value.startswith('```json\n')
         prefix = '\n' if structured and start and self.text[start - 1] != '\n' else ''
@@ -486,6 +543,79 @@ class ScratchpadPanel:
             self.paste_blocks.append(dict(start=begin, end=begin + len(value) + len(suffix), collapsed=True))
             self.cursor = begin
         self.save_position()
+
+    def _paste_file_source(self, path):
+        """Store a pasted file as a shared file source block."""
+        path = Path(path)
+        try:
+            info = path.lstat()
+        except OSError:
+            return
+        dest = self.shared_files_dir / path.name
+        try:
+            if not dest.exists() or dest.stat().st_size != info.st_size or dest.stat().st_mtime != info.st_mtime:
+                shutil.copy2(path, dest)
+        except OSError:
+            dest = path
+        mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+        is_image = mime.startswith('image/') if mime else False
+        marker = '```filesource\n'
+        closing = '\n```\n'
+        meta = (f'{marker}'
+                f'path: {dest}\n'
+                f'user_id: {self.user_id}\n'
+                f'user_name: {self.user_name}\n'
+                f'file_name: {path.name}\n'
+                f'file_size: {info.st_size}\n'
+                f'mime_type: {mime}\n'
+                f'is_image: {"true" if is_image else "false"}\n'
+                f'{closing}')
+        start, end = self.selection or (self.cursor, self.cursor)
+        prefix = '\n' if start and self.text[start - 1] != '\n' else ''
+        self.replace(start, end, prefix + meta)
+        begin = start + len(prefix)
+        entry_target = dict(kind='file_source', path=str(dest),
+                            user_id=self.user_id, user_name=self.user_name)
+        page = dict(title=f'{path.name} · file source',
+                    entries=[dict(label='Open file', target=entry_target)])
+        self.inspector.add(begin, begin + len(meta), f'file: {dest}', '',
+                           str(dest), 0, owner_user_id=self.user_id, block_type='file_source',
+                           page=page)
+        self.cursor = begin + len(meta)
+        self.save_position()
+
+    def _retrieve_file(self, user_id, path, entry_index=None):
+        """Request a file from a peer and save it locally."""
+        if not self.network:
+            self.message = 'Network not available'
+            return
+        peer_id = self.network.get_peer_for_user(user_id)
+        if not peer_id:
+            self.message = f'No connection to peer for user {user_id}'
+            return
+        self.message = f'Retrieving {Path(path).name}…'
+        self._pending_file_retrieve = (path, entry_index)
+        self.network.request_file(peer_id, path, self._on_file_retrieved)
+
+    def _on_file_retrieved(self, data, error):
+        """Called on the network thread when a peer file retrieval completes."""
+        if error:
+            self.message = f'File retrieval failed: {error}'
+            self._pending_file_retrieve = None
+            return
+        path, entry_index = self._pending_file_retrieve or (None, None)
+        if path:
+            try:
+                dest = self.shared_files_dir / Path(path).name
+                dest.write_bytes(data)
+                self.message = f'File retrieved: {dest.name}'
+            except OSError as exc:
+                self.message = f'Could not save file: {exc}'
+                self._pending_file_retrieve = None
+                return
+        self._pending_file_retrieve = None
+        # Refresh the inspector preview on the UI thread via poll.
+        self.inspector.events.put((lambda _r: self.inspector.request_preview(), None))
 
     def receive_result(self, item):
         start = self.cursor
@@ -678,6 +808,7 @@ class ScratchpadPanel:
     def open_graph(self, key, source, index=0):
         graph = self.graph(key, source)
         if isinstance(graph, Graph):
+            self.inspector.close()
             self.graph_focus = (key, source, index)
             self.graph_slider = 0
         else:
@@ -763,6 +894,19 @@ class ScratchpadPanel:
         put(rows, ' Tab/Up/Down slider | Left/Right adjust | Home/End bounds | e edit | Esc close', MUTED)
         return ''.join(output)
 
+    def _can_interact(self, block):
+        """Whether the local user may interact with this inspector block.
+
+        Captures are only interactable by the user who ran them. File sources
+        may be retrieved by any peer.
+        """
+        owner = block.get('owner_user_id')
+        if owner is None:
+            return True
+        if block.get('block_type') == 'file_source':
+            return True
+        return owner == self.user_id
+
     def toggle_inspector(self):
         if self.inspector.focus is not None:
             self.inspector.close()
@@ -776,6 +920,11 @@ class ScratchpadPanel:
         if not block.get('page'):
             self.message = 'Inspector is still loading.'
             return
+        if not self._can_interact(block):
+            owner = block.get('owner_user_id')
+            self.message = f'Inspector owned by {owner}; not interactable.'
+            return
+        self.graph_focus = None
         start = self.text.rfind('\n', 0, self.cursor) + 1
         end = self.text.find('\n', self.cursor)
         line = ANSI.sub('', self.text[start:end if end >= 0 else len(self.text)]).strip()
@@ -926,7 +1075,21 @@ class ScratchpadPanel:
                             if row == y and left <= x <= right and action == 'inspector_entry'), None)
                 if hit is not None:
                     self.inspector.index = hit
-                    if hit < len((self.inspector.page or {}).get('entries', [])):
+                    entries = (self.inspector.page or {}).get('entries', [])
+                    if hit < len(entries):
+                        entry = entries[hit]
+                        target = entry.get('target') or {}
+                        if target.get('kind') == 'file_source':
+                            path = target.get('path', '')
+                            if not Path(path).is_file():
+                                user_id = target.get('user_id', '')
+                                if user_id and self.network:
+                                    peer_id = self.network.get_peer_for_user(user_id)
+                                    if peer_id:
+                                        self.message = f'Retrieving {target.get("file_name", path)}…'
+                                        self._pending_file_retrieve = (path, hit)
+                                        self.network.request_file(peer_id, path, self._on_file_retrieved)
+                                        return
                         self.inspector.request_preview()
                     else:
                         command = self.inspector.enter(self.open_url)
@@ -940,6 +1103,9 @@ class ScratchpadPanel:
                     self.inspector.pane = 'preview'
                     command = self.inspector.activate_preview(self.open_url)
                     if command:
+                        if command.get('kind') == 'file_retrieve':
+                            self._retrieve_file(command.get('user_id'), command.get('path'), None)
+                            return
                         return ('inspector_command', command)
                     return
             command = self.inspector.event(event, value, self.open_url)
@@ -1064,7 +1230,11 @@ class ScratchpadPanel:
             inspect = next((arg for row, left, right, action, arg in self.zones
                             if row == y and left <= x <= right and action == 'inspect'), None)
             if inspect is not None:
+                if not self._can_interact(inspect):
+                    self.message = f'Inspector owned by {inspect.get("owner_user_id")}; not interactable.'
+                    return
                 self.reveal(inspect['start'], inspect['end'])
+                self.graph_focus = None
                 self.inspector.open(inspect)
                 self.follow = True
                 return
@@ -1406,6 +1576,9 @@ class ScratchpadPanel:
                 boundary = inspector_bounds[inspector['id']]
                 control_position = boundary[1] if boundary else inspector['start']
                 if not position <= control_position <= end or not inspector.get('page'):
+                    continue
+                owner = inspector.get('owner_user_id')
+                if owner is not None and inspector.get('block_type') != 'file_source' and owner != self.user_id:
                     continue
                 if any(b['kind'] == 'section' and b['body'] <= position < b['end'] for b in hidden):
                     continue

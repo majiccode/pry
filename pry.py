@@ -1334,6 +1334,7 @@ def handle_workspace_tab(event, value):
                                        clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                        open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
                                        network=network_notes,
+                                       user_id=network_notes.id, user_name=network_notes.local_name,
                                        shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
         except (OSError, ValueError) as exc:
             status_message = f'Could not open notes: {exc}'
@@ -1364,6 +1365,7 @@ def handle_submission(text):
                                            clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                            open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
                                             network=network_notes,
+                                            user_id=network_notes.id, user_name=network_notes.local_name,
                                             shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
             elif verb == '/watch':
                 if watch_engine is None:
@@ -3658,6 +3660,7 @@ def handle_direct_action(action_type, index):
                                    clipboard_copy=copy_to_clipboard, clipboard_paste=read_clipboard,
                                    open_url=webbrowser.open, cwd=lambda: conversation.cwd if conversation else os.getcwd(),
                                    network=network_notes,
+                                   user_id=network_notes.id, user_name=network_notes.local_name,
                                    shell=EXECUTION_SHELL, timeout=COMMAND_TIMEOUT)
             notes.receive_result(item)
             git_panel = notes
@@ -4007,6 +4010,9 @@ def main():
                 redraw_screen()
                 continue
             if event in ('scroll', 'wheel', 'page', 'home', 'end'):
+                if isinstance(git_panel, ScratchpadPanel) and git_panel.inspector.focus is not None:
+                    redraw_screen()
+                    continue
                 if event == 'wheel':
                     assert isinstance(value, tuple) and len(value) == 3
                     amount, x = value[:2]

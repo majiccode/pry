@@ -375,9 +375,79 @@ def file_details(path):
     return page((path.name or str(path)) + ' · details', '\n'.join(lines), attach=str(path))
 
 
+def file_source_page(target, read_text):
+    path = Path(target['path'])
+    user_id = target.get('user_id', 'unknown')
+    user_name = target.get('user_name', 'unknown')
+    is_image = target.get('is_image', 'false') == 'true'
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        return page(f'{path.name or path} · file source',
+                    f'File not available locally.\nShared by: {user_name} ({user_id})\n'
+                    f'Requested path: {path}\n'
+                    f'Use the Retrieve action to fetch it from the peer.',
+                    user_id=user_id, user_name=user_name,
+                    is_image=is_image,
+                    entries=[dict(label='Retrieve from peer',
+                                  target=dict(kind='file_retrieve',
+                                              path=str(path),
+                                              user_id=user_id,
+                                              user_name=user_name))])
+    mode = info.st_mode
+    if stat.S_ISDIR(mode):
+        kind = 'directory'
+    elif stat.S_ISREG(mode):
+        kind = 'regular file'
+    elif stat.S_ISLNK(mode):
+        kind = 'symbolic link'
+    else:
+        kind = 'special file'
+    mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+    is_image = mime.startswith('image/') if mime else False
+    lines = [
+        f'Path: {path}',
+        f'Type: {kind}',
+        f'Size: {human_size(info.st_size)} ({info.st_size:,} bytes)',
+        f'Permissions: {stat.filemode(mode)} ({oct(stat.S_IMODE(mode))})',
+        f'MIME: {mime}',
+    ]
+    if is_image:
+        lines.append('Image: yes')
+    try:
+        import pwd
+        import grp
+        owner = pwd.getpwuid(info.st_uid).pw_name
+        group = grp.getgrgid(info.st_gid).gr_name
+    except (ImportError, KeyError, AttributeError):
+        owner, group = str(getattr(info, 'st_uid', '?')), str(getattr(info, 'st_gid', '?'))
+    lines.extend([f'Owner: {owner} ({getattr(info, "st_uid", "?")})',
+                  f'Group: {group} ({getattr(info, "st_gid", "?")})'])
+    lines.extend([f'Modified: {datetime.fromtimestamp(info.st_mtime):%Y-%m-%d %H:%M:%S}',
+                  f'Accessed: {datetime.fromtimestamp(info.st_atime):%Y-%m-%d %H:%M:%S}',
+                  f'Changed: {datetime.fromtimestamp(info.st_ctime):%Y-%m-%d %H:%M:%S}'])
+    user_id = target.get('user_id', 'unknown')
+    user_name = target.get('user_name', 'unknown')
+    lines.append(f'Shared by: {user_name} ({user_id})')
+    if stat.S_ISREG(mode) and not is_image and info.st_size <= 128 * 1024:
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+            lines.append('')
+            lines.append('--- File contents ---')
+            lines.append(text[:128 * 1024])
+        except (OSError, UnicodeDecodeError):
+            lines.append('')
+            lines.append('(binary or unreadable file contents)')
+    return page((path.name or str(path)) + ' · file source', '\n'.join(lines),
+                attach=str(path), user_id=user_id, user_name=user_name,
+                is_image=is_image, mime=mime, file_path=str(path))
+
+
 def load(target, read_text):
     kind = target['kind']
     cwd = target.get('cwd', str(Path.cwd()))
+    if kind == 'file_source':
+        return file_source_page(target, read_text)
     if kind == 'inspector_text':
         return page(target['title'], target['text'])
     if kind == 'json_value':

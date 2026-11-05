@@ -61,9 +61,11 @@ class NoteInspector:
             changed = True
         return changed
 
-    def add(self, start, end, command, stdout, cwd, exit_code, page=None):
+    def add(self, start, end, command, stdout, cwd, exit_code, page=None, owner_user_id=None,
+            block_type='capture'):
         block = dict(start=start, end=end, page=deepcopy(page), id=uuid4().hex,
-                     source=dict(command=command, stdout=stdout, cwd=cwd, exit_code=exit_code))
+                     source=dict(command=command, stdout=stdout, cwd=cwd, exit_code=exit_code),
+                     owner_user_id=owner_user_id, block_type=block_type)
         self.blocks.append(block)
         if page is None:
             self.recognize(block)
@@ -193,6 +195,8 @@ class NoteInspector:
             return target
         if target.get('kind') == 'url':
             open_url(target['url'])
+        if target.get('kind') == 'file_retrieve':
+            return target
 
     def enter(self, open_url):
         items = self.items()
