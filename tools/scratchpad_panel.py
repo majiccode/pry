@@ -8,6 +8,7 @@ import io
 import mimetypes
 import os
 import queue
+import shlex
 import shutil
 import socket
 from pathlib import Path
@@ -15,7 +16,7 @@ import re
 import tempfile
 import threading
 from uuid import uuid4
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 import webbrowser
 
 from response_rendering import render_markdown, INLINE
@@ -284,15 +285,42 @@ class ScratchpadPanel:
             for start, end, meta in self._parse_file_source_fences(text):
                 path = meta.get('path', '')
                 file_name = meta.get('file_name', Path(path).name if path else 'file')
-                mime = meta.get('mime', 'application/octet-stream')
-                is_image = meta.get('is_image', 'false') == 'true'
+                mime = meta.get('mime_type') or meta.get('mime') or 'application/octet-stream'
+                is_image = str(meta.get('is_image', 'false')).strip().lower() == 'true'
+                is_directory = str(meta.get('is_directory', 'false')).strip().lower() == 'true'
                 owner_id = meta.get('user_id', peer_id or '')
                 owner_name = meta.get('user_name', '')
-                entry_target = dict(kind='file_source', path=path,
+                entry_path = path
+                if path and not Path(path).exists():
+                    local = self.shared_files_dir / Path(path).name
+                    try:
+                        if local.is_file() and str(local.stat().st_size) == str(meta.get('file_size', '')):
+                            entry_path = str(local)
+                    except OSError:
+                        pass
+                entry_target = dict(kind='file_source', path=entry_path,
                                     user_id=owner_id, user_name=owner_name,
-                                    is_image=is_image)
+                                    file_name=file_name, mime=mime,
+                                    is_image=is_image, is_directory=is_directory)
+                actions = []
+                previewable = False
+                try:
+                    file_size = int(meta.get('file_size', '0') or 0)
+                except (TypeError, ValueError):
+                    file_size = 0
+                if (not is_directory and Path(entry_path).is_file()
+                        and not is_image and file_size <= 128 * 1024):
+                    try:
+                        Path(entry_path).read_text(encoding='utf-8')
+                        previewable = True
+                    except (OSError, UnicodeDecodeError, ValueError):
+                        previewable = False
+                if not is_directory and Path(entry_path).is_file() and not previewable:
+                    actions.append(dict(label='Download file',
+                                        target=dict(kind='file_download', path=entry_path)))
                 page = dict(title=f'{file_name} · file source',
-                            entries=[dict(label='Open file', target=entry_target)])
+                            entries=[dict(label='Open file', target=entry_target)],
+                            actions=actions)
                 self.inspector.add(start, end, f'file: {path}', '', path, 0,
                                    owner_user_id=peer_id, block_type='file_source',
                                    page=page)
@@ -528,21 +556,84 @@ class ScratchpadPanel:
         self.follow = True
         self.save_position()
 
+    def _resolve_dropped_path(self, value):
+        value = value.strip()
+        if not value:
+            return None
+        if value.startswith('file://'):
+            value = unquote(urlsplit(value).path)
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(self.cwd() if callable(self.cwd) else self.cwd) / candidate
+        try:
+            if candidate.is_symlink():
+                return None
+            if candidate.is_file() or candidate.is_dir():
+                return candidate
+        except OSError:
+            pass
+        return None
+
+    def _dropped_files(self, value):
+        """Resolve pasted or dropped paths, including quoted names and folders."""
+        text = value.strip()
+        if not text or '\x00' in text:
+            return []
+        candidates = [text]
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            parts = []
+        if len(parts) > 1:
+            resolved = [self._resolve_dropped_path(part) for part in parts]
+            if all(resolved):
+                candidates = resolved
+            else:
+                candidates.extend(parts)
+        elif parts:
+            candidates.append(parts[0])
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) > 1:
+            resolved = [self._resolve_dropped_path(line) for line in lines]
+            if all(resolved):
+                candidates = resolved
+            else:
+                candidates.extend(lines)
+        resolved = []
+        for candidate in candidates:
+            path = candidate if isinstance(candidate, Path) else self._resolve_dropped_path(candidate)
+            if path is not None and path not in resolved:
+                resolved.append(path)
+        files = []
+        for path in resolved:
+            if not path.is_dir():
+                files.append(path)
+                continue
+            for root, folders, names in os.walk(path):
+                folders[:] = sorted(name for name in folders if not name.startswith('.'))
+                for name in sorted(names):
+                    child = Path(root) / name
+                    try:
+                        if child.is_symlink() or not child.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    files.append(child)
+                    if len(files) >= 100:
+                        return files
+        return files
+
     def paste(self, value):
         value = value.replace('\r\n', '\n').replace('\r', '\n').replace('\t', '    ')
         value = ''.join(c for c in value if c == '\n' or c.isprintable() or c == '\u200d')
         value = prepare_paste(value)
         if not value:
             return
-        # Detect a pasted file path: a single existing file becomes a file source block.
-        stripped = value.strip()
-        if '\n' not in stripped:
-            candidate = Path(stripped).expanduser()
-            if not candidate.is_absolute():
-                candidate = Path(self.cwd() if callable(self.cwd) else self.cwd) / candidate
-            if candidate.is_file() and not candidate.is_symlink():
-                self._paste_file_source(candidate)
-                return
+        dropped = self._dropped_files(value)
+        if dropped:
+            for path in dropped:
+                self._paste_file_source(path)
+            return
         large = len(value) > 1000 or len(value.splitlines()) > 10
         start, end = self.selection or (self.cursor, self.cursor)
         structured = large or value.startswith('```json\n')
@@ -562,12 +653,16 @@ class ScratchpadPanel:
             info = path.lstat()
         except OSError:
             return
+        is_directory = path.is_dir()
         dest = self.shared_files_dir / path.name
-        try:
-            if not dest.exists() or dest.stat().st_size != info.st_size or dest.stat().st_mtime != info.st_mtime:
-                shutil.copy2(path, dest)
-        except OSError:
+        if is_directory:
             dest = path
+        else:
+            try:
+                if not dest.exists() or dest.stat().st_size != info.st_size or dest.stat().st_mtime != info.st_mtime:
+                    shutil.copy2(path, dest)
+            except OSError:
+                dest = path
         mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
         is_image = mime.startswith('image/') if mime else False
         marker = '```filesource\n'
@@ -580,13 +675,16 @@ class ScratchpadPanel:
                 f'file_size: {info.st_size}\n'
                 f'mime_type: {mime}\n'
                 f'is_image: {"true" if is_image else "false"}\n'
+                f'is_directory: {"true" if is_directory else "false"}\n'
                 f'{closing}')
         start, end = self.selection or (self.cursor, self.cursor)
         prefix = '\n' if start and self.text[start - 1] != '\n' else ''
         self.replace(start, end, prefix + meta)
         begin = start + len(prefix)
         entry_target = dict(kind='file_source', path=str(dest),
-                            user_id=self.user_id, user_name=self.user_name)
+                            user_id=self.user_id, user_name=self.user_name,
+                            file_name=path.name, mime=mime, is_image=is_image,
+                            is_directory=is_directory)
         page = dict(title=f'{path.name} · file source',
                     entries=[dict(label='Open file', target=entry_target)])
         self.inspector.add(begin, begin + len(meta), f'file: {dest}', '',
@@ -594,6 +692,26 @@ class ScratchpadPanel:
                            page=page)
         self.cursor = begin + len(meta)
         self.save_position()
+
+    def _download_file(self, path):
+        """Copy a local shared file into the working directory for CLI tools."""
+        source = Path(path)
+        if not source.is_file():
+            self.message = f'File not available: {source.name}'
+            return
+        cwd = Path(self.cwd() if callable(self.cwd) else self.cwd)
+        destination = cwd / source.name
+        if destination.exists():
+            index = 1
+            while destination.exists():
+                destination = cwd / f'{source.stem} ({index}){source.suffix}'
+                index += 1
+        try:
+            shutil.copy2(source, destination)
+        except OSError as exc:
+            self.message = f'Download failed: {exc}'
+            return
+        self.message = f'Downloaded {source.name} to {destination}'
 
     def _retrieve_file(self, user_id, path, entry_index=None):
         """Request a file from a peer and save it locally."""
@@ -607,6 +725,23 @@ class ScratchpadPanel:
         self.message = f'Retrieving {Path(path).name}…'
         self._pending_file_retrieve = (path, entry_index)
         self.network.request_file(peer_id, path, self._on_file_retrieved)
+
+    def _localize_file_targets(self, remote_path, local_path):
+        remote, local = str(remote_path), str(local_path)
+        def update(page):
+            if not isinstance(page, dict):
+                return
+            for item in list(page.get('entries', [])) + list(page.get('actions', [])):
+                target = item.get('target')
+                if (isinstance(target, dict) and target.get('path') == remote
+                        and target.get('kind') in ('file_source', 'file_retrieve', 'path')):
+                    target['path'] = local
+                    if target.get('kind') != 'path':
+                        target['file_name'] = Path(local).name
+        for block in self.inspector.blocks:
+            update(block.get('page'))
+        update(self.inspector.page)
+        update(self.inspector.preview)
 
     def _on_file_retrieved(self, data, error):
         """Called on the network thread when a peer file retrieval completes."""
@@ -624,9 +759,19 @@ class ScratchpadPanel:
                 self.message = f'Could not save file: {exc}'
                 self._pending_file_retrieve = None
                 return
+        else:
+            dest = None
         self._pending_file_retrieve = None
-        # Refresh the inspector preview on the UI thread via poll.
-        self.inspector.events.put((lambda _r: self.inspector.request_preview(), None))
+        def refreshed(_result):
+            if path and dest:
+                self._localize_file_targets(path, dest)
+            focus = self.inspector.focus
+            if focus is not None:
+                self.inspector.open(focus)
+            else:
+                self.inspector.request_preview()
+        # Refresh the inspector on the UI thread via poll.
+        self.inspector.events.put((refreshed, None))
 
     def receive_result(self, item):
         start = self.cursor
@@ -1073,6 +1218,30 @@ class ScratchpadPanel:
             self.message = 'Private notes'
         self.save_position()
 
+    def _activate_inspector_target(self, target, entry_index=None):
+        if not isinstance(target, dict):
+            return None
+        kind = target.get('kind')
+        if kind == 'file_download':
+            self._download_file(target.get('path', ''))
+            return None
+        if kind in ('file_source', 'file_retrieve'):
+            path = target.get('path', '')
+            if path and Path(path).exists():
+                if kind == 'file_retrieve':
+                    target = dict(target, kind='file_source')
+                self.inspector.load(target)
+                return None
+            user_id = target.get('user_id', '')
+            if user_id and self.network:
+                self._retrieve_file(user_id, path, entry_index)
+            else:
+                self.message = 'File is not available locally and no peer is connected.'
+            return None
+        if kind == 'inspector_command':
+            return ('inspector_command', target)
+        return None
+
     def event(self, event, value):
         if event == 'function' and value == 1:
             self.toggle_inspector()
@@ -1094,40 +1263,34 @@ class ScratchpadPanel:
                     self.inspector.index = hit
                     entries = (self.inspector.page or {}).get('entries', [])
                     if hit < len(entries):
-                        entry = entries[hit]
-                        target = entry.get('target') or {}
-                        if target.get('kind') == 'file_source':
+                        target = entries[hit].get('target') or {}
+                        kind = target.get('kind')
+                        if kind in ('file_source', 'file_retrieve'):
                             path = target.get('path', '')
-                            if not Path(path).is_file():
-                                user_id = target.get('user_id', '')
-                                if user_id and self.network:
-                                    peer_id = self.network.get_peer_for_user(user_id)
-                                    if peer_id:
-                                        self.message = f'Retrieving {target.get("file_name", path)}…'
-                                        self._pending_file_retrieve = (path, hit)
-                                        self.network.request_file(peer_id, path, self._on_file_retrieved)
-                                        return
+                            if kind == 'file_retrieve' or not Path(path).exists():
+                                self._activate_inspector_target(target, hit)
+                                return
                         self.inspector.request_preview()
                     else:
-                        command = self.inspector.enter(self.open_url)
-                        if command:
-                            return ('inspector_command', command)
+                        result = self._activate_inspector_target(
+                            self.inspector.enter(self.open_url), hit)
+                        if result:
+                            return result
                     return
                 button = next((arg for row, left, right, action, arg in self.zones
                                if row == y and left <= x <= right and action == 'preview_action'), None)
                 if button is not None:
                     self.inspector.action_index = button
                     self.inspector.pane = 'preview'
-                    command = self.inspector.activate_preview(self.open_url)
-                    if command:
-                        if command.get('kind') == 'file_retrieve':
-                            self._retrieve_file(command.get('user_id'), command.get('path'), None)
-                            return
-                        return ('inspector_command', command)
+                    result = self._activate_inspector_target(
+                        self.inspector.activate_preview(self.open_url))
+                    if result:
+                        return result
                     return
-            command = self.inspector.event(event, value, self.open_url)
-            if command:
-                return ('inspector_command', command)
+            result = self._activate_inspector_target(
+                self.inspector.event(event, value, self.open_url), self.inspector.index)
+            if result:
+                return result
             return
         if event == 'key' and value == '\x03' and self.capture_job is not None:
             self.capture_job.cancel()

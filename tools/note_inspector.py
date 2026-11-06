@@ -177,6 +177,11 @@ class NoteInspector:
                                       f'Requested path: {target.get("path", "")}\n'
                                       'Activate to fetch it from the peer.'))
             return
+        if target.get('kind') == 'file_download':
+            self.preview = dict(title=item.get('label', 'Download file'), entries=[],
+                                text=(f'Path: {target.get("path", "")}\n\n'
+                                      'Press Space to download this file into the current working directory.'))
+            return
         preview_target = dict(target, details=True) if target.get('kind') == 'path' else target
         key = json.dumps(preview_target, sort_keys=True, default=str)
         if key in self.preview_cache:
@@ -206,6 +211,8 @@ class NoteInspector:
             open_url(target['url'])
         if target.get('kind') == 'file_retrieve':
             return target
+        if target.get('kind') == 'file_download':
+            return target
 
     def enter(self, open_url):
         items = self.items()
@@ -221,6 +228,12 @@ class NoteInspector:
             return target
         if target.get('kind') == 'file_retrieve':
             return target
+        if target.get('kind') == 'file_download':
+            return target
+        if target.get('kind') == 'file_source':
+            path = target.get('path')
+            if path and not Path(path).exists():
+                return target
         self.load(target)
 
     def load(self, target, remember=True):

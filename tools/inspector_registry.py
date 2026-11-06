@@ -379,21 +379,27 @@ def file_source_page(target, read_text):
     path = Path(target['path'])
     user_id = target.get('user_id', 'unknown')
     user_name = target.get('user_name', 'unknown')
-    is_image = target.get('is_image', 'false') == 'true'
+    is_image = str(target.get('is_image', 'false')).lower() == 'true'
+    is_directory = str(target.get('is_directory', 'false')).lower() == 'true'
     try:
         info = path.lstat()
     except OSError as exc:
+        entries = [] if is_directory else [dict(
+            label='Retrieve from peer',
+            target=dict(kind='file_retrieve',
+                        path=str(path),
+                        file_name=path.name,
+                        user_id=user_id,
+                        user_name=user_name))]
+        kind = 'Directory' if is_directory else 'File'
         return page(f'{path.name or path} · file source',
-                    f'File not available locally.\nShared by: {user_name} ({user_id})\n'
+                    f'{kind} not available locally.\n'
+                    f'Shared by: {user_name} ({user_id})\n'
                     f'Requested path: {path}\n'
-                    f'Use the Retrieve action to fetch it from the peer.',
+                    + ('' if is_directory else 'Use the Retrieve action to fetch it from the peer.'),
                     user_id=user_id, user_name=user_name,
-                    is_image=is_image,
-                    entries=[dict(label='Retrieve from peer',
-                                  target=dict(kind='file_retrieve',
-                                              path=str(path),
-                                              user_id=user_id,
-                                              user_name=user_name))])
+                    is_image=is_image, is_directory=is_directory,
+                    entries=entries)
     mode = info.st_mode
     if stat.S_ISDIR(mode):
         kind = 'directory'
@@ -429,18 +435,27 @@ def file_source_page(target, read_text):
     user_id = target.get('user_id', 'unknown')
     user_name = target.get('user_name', 'unknown')
     lines.append(f'Shared by: {user_name} ({user_id})')
+    previewable = False
     if stat.S_ISREG(mode) and not is_image and info.st_size <= 128 * 1024:
         try:
-            text = path.read_text(encoding='utf-8', errors='replace')
+            text = read_text(path)
+        except (OSError, ValueError):
+            text = None
+        if text is not None:
+            previewable = True
             lines.append('')
             lines.append('--- File contents ---')
             lines.append(text[:128 * 1024])
-        except (OSError, UnicodeDecodeError):
-            lines.append('')
-            lines.append('(binary or unreadable file contents)')
+    actions = []
+    if stat.S_ISREG(mode) and not previewable:
+        lines.append('')
+        lines.append('Preview unavailable for this format. Download it to use a command-line tool.')
+        actions.append(dict(label='Download file',
+                            target=dict(kind='file_download', path=str(path))))
     return page((path.name or str(path)) + ' · file source', '\n'.join(lines),
                 attach=str(path), user_id=user_id, user_name=user_name,
-                is_image=is_image, mime=mime, file_path=str(path))
+                is_image=is_image, is_directory=is_directory, mime=mime,
+                file_path=str(path), actions=actions)
 
 
 def load(target, read_text):
