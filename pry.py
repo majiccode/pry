@@ -3858,6 +3858,8 @@ def main():
                 mouse_hover = value
                 if hover_region(mouse_hover) != previous:
                     redraw_screen()
+                if isinstance(git_panel, ScratchpadPanel) and git_panel.graph_focus is not None:
+                    git_panel.graph_event('hover', value)
                 continue
             if event not in ('click', 'drag', 'release', 'right_click', 'ignore', 'hover'):
                 mouse_selection, mouse_press = None, None

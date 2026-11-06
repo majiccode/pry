@@ -94,6 +94,10 @@ class ScratchpadPanel:
         self.graph_focus = None
         self.graph_slider = 0
         self.graph_zones = []
+        self.graph_drag_start = None
+        self.graph_draw_rect = None
+        self.graph_reset_zone = None
+        self.graph_hover = None
         self.paste_blocks = []
         self.inspector = NoteInspector()
         self.collapsed_sections = set()
@@ -995,10 +999,66 @@ class ScratchpadPanel:
                     self.cursor = block[0]
                     self.selection = self.anchor = None
                     self.follow = True
+            self.graph_drag_start = None
+            return
+        if event == 'release':
+            self.graph_drag_start = None
+            self.graph_hover = None
+            return
+        if event == 'hover':
+            x, y = value
+            rect = self.graph_draw_rect
+            if rect is not None:
+                dt, db, l, r = rect
+                if l <= x <= r and dt <= y <= db:
+                    self.graph_hover = (x, y)
+                    return
+            self.graph_hover = None
             return
         if event == 'key' and value in ('[', ']'):
             self.graph_focus = (key, source, (index + (1 if value == ']' else -1)) % len(graph.plots))
             self.graph_slider = 0
+            return
+        if event == 'wheel':
+            amount, mx, my = value
+            rect = self.graph_draw_rect
+            if rect is not None:
+                dt, db, l, r = rect
+                if l <= mx <= r and dt <= my <= db:
+                    factor = 1.25 if amount > 0 else 0.8
+                    cx = (mx - l) / max(1, r - l + 1)
+                    cy = (my - dt) / max(1, db - dt + 1)
+                    graph.zoom('x', factor, cx)
+                    graph.zoom('y', factor, cy)
+                    self.graph_values[key] = dict(graph.values)
+                    self.save_position()
+                    return
+        if event == 'page':
+            rect = self.graph_draw_rect
+            factor = 1.25 if value > 0 else 0.8
+            if rect is not None:
+                dt, db, l, r = rect
+                cx = 0.5
+                cy = 0.5
+            else:
+                cx, cy = 0.5, 0.5
+            graph.zoom('x', factor, cx)
+            graph.zoom('y', factor, cy)
+            self.graph_values[key] = dict(graph.values)
+            self.save_position()
+            return
+        if event == 'key' and value in ('-', '='):
+            rect = self.graph_draw_rect
+            factor = 0.8 if value == '-' else 1.25
+            cx = cy = 0.5
+            if rect is not None:
+                dt, db, l, r = rect
+                cx = 0.5
+                cy = 0.5
+            graph.zoom('x', factor, cx)
+            graph.zoom('y', factor, cy)
+            self.graph_values[key] = dict(graph.values)
+            self.save_position()
             return
         if not controls:
             return
@@ -1014,6 +1074,33 @@ class ScratchpadPanel:
             self.save_position()
         elif event in ('click', 'drag'):
             x, y = value
+            if self.graph_reset_zone is not None:
+                rrow, rleft, rright = self.graph_reset_zone
+                if y == rrow and rleft <= x <= rright:
+                    graph.reset_origin()
+                    self.graph_values[key] = dict(graph.values)
+                    self.save_position()
+                    return
+            rect = self.graph_draw_rect
+            if event == 'click' and rect is not None:
+                dt, db, l, r = rect
+                if l <= x <= r and dt <= y <= db:
+                    self.graph_drag_start = (x, y, dict(graph.axis_views))
+                    return
+            if event == 'drag' and self.graph_drag_start is not None and rect is not None:
+                sx, sy, _ = self.graph_drag_start
+                dt, db, l, r = rect
+                if l <= x <= r and dt <= y <= db:
+                    dx = x - sx
+                    dy = y - sy
+                    inner_w = max(1, r - l + 1)
+                    draw_h = max(1, db - dt + 1)
+                    graph.pan('x', dx / inner_w)
+                    graph.pan('y', dy / draw_h)
+                    self.graph_values[key] = dict(graph.values)
+                    self.save_position()
+                    self.graph_drag_start = (x, y, dict(graph.axis_views))
+                    return
             for row, left, right, number in self.graph_zones:
                 if row == y:
                     self.graph_slider = number
@@ -1036,11 +1123,27 @@ class ScratchpadPanel:
 
         for row in range(top + 1, rows + 1):
             put(row, '')
-        put(top + 1, f' Graph {index + 1}/{len(graph.plots)} | [ / ] previous / next plot', ACCENT)
+        header = f' Graph {index + 1}/{len(graph.plots)} | [ / ] previous / next plot  ⟲ reset origin '
+        put(top + 1, header, ACCENT)
+        reset_label = '⟲ reset origin'
+        reset_idx = header.find(reset_label)
+        if reset_idx >= 0:
+            self.graph_reset_zone = (top + 1, reset_idx + 1, reset_idx + len(reset_label))
+        else:
+            self.graph_reset_zone = None
         room = max(0, rows - top - 3)
         slider_rows = min(len(controls), max(0, room // 3))
         graph_height = max(0, room - slider_rows)
-        for number, line in enumerate(graph.render(cols, graph_height, index)):
+        margin = 10 if cols >= 24 else 0
+        self.graph_draw_rect = (top + 2, top + 1 + graph_height, margin + 1, cols)
+        hover = None
+        if self.graph_hover is not None:
+            hx, hy = self.graph_hover
+            if margin + 1 <= hx <= cols and top + 2 <= hy <= top + 1 + graph_height:
+                px = (hx - (margin + 1)) * 2
+                py = (hy - (top + 2)) * 4
+                hover = (px, py)
+        for number, line in enumerate(graph.render(cols, graph_height, index, hover=hover)):
             put(top + 2 + number, line)
         first = max(0, self.graph_slider - slider_rows + 1)
         for number, name in enumerate(controls[first:first + slider_rows], first):
@@ -1056,7 +1159,7 @@ class ScratchpadPanel:
             put(row, prefix + track + suffix, ACCENT if number == self.graph_slider else MUTED)
             self.graph_zones.append((row, len(prefix) + 1, len(prefix) + track_width, number))
         put(rows - 1, self.message if self.message.startswith('Could not') else ' Parameters reshape curves; axis handles set the visible x/y range.', MUTED)
-        put(rows, ' Tab/Up/Down slider | Left/Right adjust | Home/End bounds | e edit | Esc close', MUTED)
+        put(rows, ' Drag to pan | - / + zoom | Tab/Up/Down slider | Left/Right adjust | Home/End bounds | e edit | Esc close', MUTED)
         return ''.join(output)
 
     def _can_interact(self, block):

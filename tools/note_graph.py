@@ -75,6 +75,7 @@ _BINARY = {ast.Add: operator.add, ast.Sub: operator.sub,
 _PALETTE = (SECONDARY, SUCCESS, WARNING, '\033[38;5;213m',
             '\033[38;5;81m', '\033[38;5;203m', '\033[38;5;229m',
             '\033[38;5;141m')
+_PAN_SENSITIVITY = 0.3
 _NAME = r'[A-Za-z_][A-Za-z_0-9]{0,31}'
 _DOTS = ((1, 8), (2, 16), (4, 32), (64, 128))
 _AXIS_DECLARATIONS = {'axisx': 'x', 'axisy': 'y', 'x_axis': 'x', 'y_axis': 'y',
@@ -341,6 +342,7 @@ class Graph:
                     lo, hi = self.ranges[name]
                     self.values[name] = max(lo, min(hi, value))
         self._sync_axis_views()
+        self.initial_values = dict(self.values)
 
     # ------------------------------------------------------------------
     # parsing helpers
@@ -697,6 +699,115 @@ class Graph:
         lo, hi = self.ranges[name]
         self.values[name] = lo * (1 - fraction) + hi * fraction
 
+    def pan(self, axis, delta_fraction):
+        """Shift the visible axis view by delta_fraction of its current span.
+
+        The drawing follows the cursor (direct manipulation): dragging right
+        shifts x toward smaller values, dragging down shifts y toward larger
+        values. The view can be panned past the declared axis range; only the
+        window itself must stay valid (lo < hi).
+        """
+        if isinstance(delta_fraction, bool) or not isinstance(delta_fraction, (int, float)):
+            return
+        try:
+            delta_fraction = float(delta_fraction)
+        except (OverflowError, ValueError):
+            return
+        if not math.isfinite(delta_fraction):
+            return
+        if axis not in self.axis_views:
+            return
+        lo, hi = self.axis_views[axis]
+        span = hi - lo
+        if span <= 0:
+            return
+        shift = span * delta_fraction * _PAN_SENSITIVITY
+        view_lo, view_hi = lo - shift, hi - shift
+        base = self.axis_ranges.get(axis)
+        if base is not None:
+            blo, bhi = base
+            if view_lo < blo:
+                view_lo = blo
+                view_hi = min(bhi, blo + span)
+            if view_hi > bhi:
+                view_hi = bhi
+                view_lo = max(blo, bhi - span)
+            if view_hi <= view_lo:
+                view_hi = min(bhi, blo + span)
+                view_lo = max(blo, bhi - span)
+                if view_hi <= view_lo:
+                    pad = max(1e-9, abs(view_lo) * 1e-9)
+                    view_hi = view_lo + pad
+        else:
+            if view_hi <= view_lo:
+                pad = max(1e-9, abs(view_lo) * 1e-9)
+                view_hi = view_lo + pad
+        self.axis_views[axis] = (view_lo, view_hi)
+        for plot in self.plots:
+            plot.axes[axis] = (view_lo, view_hi)
+
+    def zoom(self, axis, factor, center_fraction):
+        """Zoom the visible axis view around center_fraction (0..1 across the view).
+
+        factor > 1 zooms in (shrinks the span), factor < 1 zooms out. The view
+        is clamped to the declared axis range so it never exceeds the domain.
+        """
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            return
+        try:
+            factor = float(factor)
+        except (OverflowError, ValueError):
+            return
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        base = self.axis_ranges.get(axis)
+        if base is None or axis not in self.axis_views:
+            return
+        lo, hi = self.axis_views[axis]
+        span = hi - lo
+        if span <= 0:
+            return
+        new_span = span / factor
+        center = lo + span * center_fraction
+        new_lo = center - new_span * center_fraction
+        new_hi = center + new_span * (1.0 - center_fraction)
+        blo, bhi = base
+        full = bhi - blo
+        if new_span >= full:
+            new_lo, new_hi = blo, bhi
+        else:
+            if new_lo < blo:
+                new_lo = blo
+                new_hi = blo + new_span
+            if new_hi > bhi:
+                new_hi = bhi
+                new_lo = bhi - new_span
+        self.axis_views[axis] = (new_lo, new_hi)
+        self.values[f'{axis}_axis.min'] = new_lo
+        self.values[f'{axis}_axis.max'] = new_hi
+        for plot in self.plots:
+            plot.axes[axis] = (new_lo, new_hi)
+
+    def reset_origin(self):
+        """Reset every adjustable value to what was declared in the graph
+        section: axis views back to their declared ranges, and every ranged
+        variable (slider) back to its initial value."""
+        for axis in ('x', 'y'):
+            base = self.axis_ranges.get(axis)
+            if base is None or axis not in self.axis_views:
+                continue
+            blo, bhi = base
+            self.axis_views[axis] = (blo, bhi)
+            self.values[f'{axis}_axis.min'] = blo
+            self.values[f'{axis}_axis.max'] = bhi
+            for plot in self.plots:
+                plot.axes[axis] = (blo, bhi)
+        for name, value in self.initial_values.items():
+            if name not in self.ranges:
+                continue
+            lo, hi = self.ranges[name]
+            self.values[name] = max(lo, min(hi, value))
+
     # ------------------------------------------------------------------
     # rendering
 
@@ -758,12 +869,16 @@ class Graph:
                     points.append((x, y))
         return points
 
-    def render(self, width, height, plot_index=0):
+    def render(self, width, height, plot_index=0, hover=None):
         """Draw within the supplied viewport using the current axis views.
 
         Domain/overflow errors leave gaps. Large adjacent jumps are not joined.
         An exhausted shared operation budget leaves gaps and a visible notice.
         No terminal I/O, terminal-size detection, or slider rendering occurs.
+
+        ``hover`` is an optional (px, py) pixel position within the drawing
+        area; when supplied a crosshair is drawn at that point and the
+        corresponding data values are appended to the readout.
         """
         plot = self._plot(plot_index)
         if type(width) is not int or type(height) is not int:
@@ -904,6 +1019,17 @@ class Graph:
                             for step in range(1, distance):
                                 dot(px, previous + (1 if py > previous else -1) * step, color)
                     previous = py if not discrete else None
+        hover_readout = ''
+        if hover is not None and drawing_height and not empty:
+            hx, hy = hover
+            if 0 <= hx < nx and 0 <= hy < drawing_height * 4:
+                for py in range(drawing_height * 4):
+                    dot(hx, py, ACCENT)
+                for px in range(nx):
+                    dot(px, hy, ACCENT)
+                x_data = xlo + hx / (nx - 1) * xspan if xspan else xlo
+                y_data = yhi - hy / (ny - 1) * yspan if yspan else ylo
+                hover_readout = f' x={x_data:.4g} y={y_data:.4g}'
         for row in range(drawing_height):
             prefix = ''
             if margin:
@@ -948,5 +1074,6 @@ class Graph:
             readout = 'empty axis | ' + readout
         elif drawing_height and not xs and not any(c.kind == 'implicit' for c in plot.curves):
             readout = 'no finite samples | ' + readout
+        readout += hover_readout
         rows.append(styled(readout, WARNING if exhausted or empty else ACCENT))
         return rows[:height]
