@@ -3,15 +3,34 @@
 One statement per line; # comments and semicolon separators are supported.
 Ranges have constant endpoints. A scalar assignment to a ranged name sets its
 initial value (and must also be constant). Other assignments are live formulas.
-Each plot captures all formula definitions preceding it: every definition of
-its output is a curve, and dependencies use their last captured definition.
-Forward references within that snapshot are allowed; cycles are not.
+Each plot captures all formula definitions preceding it.
+
+Simple plots let the graph work out what to draw:
+
+    x_axis=[-1..1]
+    y_axis=[-1..1]
+    a=[-1..1]
+    y=sin(x*tau)*a
+    plot(y)              # y=f(x), with a as a slider
+    t=[0..1]
+    plotxy(cos(t*tau), sin(t*tau))   # parametric
+    f=x^2+y^2-1
+    plot(f)              # implicit f(x,y)=0
+
+`plot(x)` and `plot(y)` also understand `x=f(y)` and `y=f(x)` when the
+expression uses the plane coordinate directly. `plot(a,b,...)` draws all of
+the supplied functions on one set of axes. Parameters are inferred from the
+ranged variables used by the plotted expressions.
+
+The older explicit form `plot(output,sweep,parameters...)` remains supported.
+`axisx`/`axisy` and `x_axis`/`y_axis` set the visible ranges; axis range
+handles appear as sliders alongside the parameter sliders.
 
 render(width, height) returns at most height rows of at most width visible
 columns, capped at 240 columns and 64 rows. Height includes the title/legend,
-horizontal-axis labels, and playhead readout, not slider controls. Braille uses
-real Unicode characters for a 2-by-4 subcell drawing grid. ANSI SGR sequences
-do not count toward the width. Small viewports gracefully omit drawing rows.
+axis labels, and readout, not slider controls. Braille uses real Unicode
+characters for a 2-by-4 subcell drawing grid. ANSI SGR sequences do not count
+toward the width. Small viewports gracefully omit drawing rows.
 """
 
 import ast
@@ -24,16 +43,18 @@ import re
 from tui_theme import ACCENT, BASE, BORDER, MUTED, SECONDARY, SUCCESS, WARNING
 
 
-EXAMPLE_SOURCE = """xaxis=[0..1]
+EXAMPLE_SOURCE = """x_axis=[-2..2]
+y_axis=[-2..2]
+a=[-1..1]
+a=1
+y=sin(x*tau)*a
+plot(y)
 t=[0..1]
-t=0
-amp=[-2..2]
-amp=0
-a=sin(2*pi*(xaxis-t))+amp
-x=a
-x=cos(2*pi*(xaxis-t))+amp
-axisy=[-3..3]
-plot(x,xaxis,t,amp)"""
+plotxy(cos(t*tau),sin(t*tau))
+r=[0..2]
+r=1
+f=x^2+y^2-r^2
+plot(f)"""
 
 _LIMIT = 1e100
 _FUNCTIONS = {
@@ -46,7 +67,8 @@ _FUNCTIONS = {
     'floor': (math.floor, 1, 1), 'ceil': (math.ceil, 1, 1),
     'min': (min, 2, 16), 'max': (max, 2, 16),
 }
-_CONSTANTS = {'pi': math.pi, 'e': math.e, 'tau': math.tau}
+_CONSTANTS = {'pi': math.pi, 'PI': math.pi, 'e': math.e, 'E': math.e,
+              'tau': math.tau, 'TAU': math.tau}
 _BINARY = {ast.Add: operator.add, ast.Sub: operator.sub,
            ast.Mult: operator.mul, ast.Div: operator.truediv,
            ast.Mod: operator.mod, ast.Pow: operator.pow}
@@ -55,6 +77,9 @@ _PALETTE = (SECONDARY, SUCCESS, WARNING, '\033[38;5;213m',
             '\033[38;5;141m')
 _NAME = r'[A-Za-z_][A-Za-z_0-9]{0,31}'
 _DOTS = ((1, 8), (2, 16), (4, 32), (64, 128))
+_AXIS_DECLARATIONS = {'axisx': 'x', 'axisy': 'y', 'x_axis': 'x', 'y_axis': 'y',
+                      'xrange': 'x', 'yrange': 'y'}
+_AXIS_CONTROL_SUFFIX = {'.min': 0, '.max': 1}
 
 
 class _BudgetExceeded(Exception):
@@ -82,6 +107,24 @@ class _Expression:
 
 
 @dataclass
+class _Curve:
+    label: str
+    kind: str = 'function'          # function, parametric, implicit
+    expression: _Expression = None
+    name: str = None
+    variant: int = None
+    xexpr: _Expression = None
+    xname: str = None
+    yexpr: _Expression = None
+    yname: str = None
+    orientation: str = 'y_of_x'     # y_of_x or x_of_y
+    sweep: str = None
+    sweep_axis: str = 'x'
+    domain: tuple = None
+    line: int = 1
+
+
+@dataclass
 class _Plot:
     output: str
     sweep: str
@@ -91,6 +134,27 @@ class _Plot:
     axes: dict
     line: int
     controls: tuple = ()
+    old: bool = False
+    sweep_axis: str = 'x'
+
+
+def _split_args(text):
+    """Split a comma-separated argument list, respecting nested brackets."""
+    parts, current, depth = [], [], 0
+    for char in text:
+        if char in '([{':
+            depth += 1
+        elif char in ')]}':
+            depth -= 1
+        if char == ',' and depth == 0:
+            parts.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    tail = ''.join(current).strip()
+    if tail or parts:
+        parts.append(tail)
+    return parts
 
 
 def _expression(text, line, node_count):
@@ -167,12 +231,17 @@ def _constant(expression):
 class Graph:
     """Parse eagerly; invalid declarations raise line-specific ValueError.
 
-    ranges excludes axisx/axisy. values contains only ranged variables, with
-    finite persisted numbers clamped to their ranges; invalid entries are
-    ignored. Defaults are the range midpoint, or a constant scalar initializer.
-    controls() returns the sweep first, explicit parameters next, then inferred
-    ranged dependencies in declaration order. adjust() accepts an absolute
-    fraction, clamps it to [0, 1], and updates values in place.
+    ``ranges`` contains the adjustable user variables followed by axis-range
+    controls (for declared axes). ``values`` holds their current values.
+    ``controls()`` returns the user variables for a particular plot, and
+    ``sliders()`` appends the axis-range handles used by the graph view.
+
+    New-style plots derive their orientation and domain from the expression
+    names. A lone ``x`` dependency means y=f(x); a lone ``y`` dependency means
+    x=f(y). If both appear the expression is an implicit curve. Named ``x`` and
+    ``y`` expressions follow the same x=f(y) and y=f(x) convention even when
+    their formulas only use parameter variables. Parametric plots use the first
+    ranged variable they find as their sweep; implicit plots sample the plane.
     """
 
     def __init__(self, source, values=None):
@@ -185,34 +254,31 @@ class Graph:
             raise _error(257, 'source exceeds 256 lines')
         self.ranges = {}
         self.values = {}
+        self.axis_ranges = {}
+        self.axis_views = {}
+        self.axis_controls = {}
         self.plots = []
         definitions, axes, initial = {}, {}, {}
         node_count = [0]
         assignments = 0
         for line, raw in enumerate(lines, 1):
-            for statement in raw.split('#', 1)[0].split(';'):
+            code = raw.split('#', 1)[0]
+            if code.lstrip().startswith(';'):
+                continue
+            for statement in code.split(';'):
                 statement = statement.strip()
                 if not statement:
                     continue
-                plot_match = re.fullmatch(r'plot\s*\((.*)\)', statement)
+                plot_match = re.fullmatch(r'(plot|plotxy)\s*\((.*)\)', statement)
                 if plot_match:
-                    args = [arg.strip() for arg in plot_match[1].split(',')]
-                    if not 2 <= len(args) <= 18 or not all(re.fullmatch(_NAME, a) for a in args):
-                        raise _error(line, 'use plot(output, sweep, optional_parameters...)')
-                    if len(set(args)) != len(args):
-                        raise _error(line, 'plot names must be distinct')
-                    if len(self.plots) >= 8:
-                        raise _error(line, 'at most 8 plots are allowed')
-                    curves = tuple(definitions.get(args[0], ()))
-                    self.plots.append(_Plot(args[0], args[1], tuple(args[2:]),
-                                            {k: tuple(v) for k, v in definitions.items()},
-                                            curves, dict(axes), line))
+                    self._parse_plot(plot_match[1], plot_match[2], line,
+                                     definitions, axes, node_count)
                     continue
                 match = re.fullmatch(rf'({_NAME})\s*=\s*(.+)', statement)
                 if not match:
                     raise _error(line, 'expected name=expression, name=[lo..hi], or plot(...)')
                 name, text = match.groups()
-                if name in _CONSTANTS or name in _FUNCTIONS or name == 'plot':
+                if name in _CONSTANTS or name in _FUNCTIONS or name in ('plot', 'plotxy'):
                     raise _error(line, f'reserved name {name}')
                 assignments += 1
                 if assignments > 96:
@@ -224,8 +290,13 @@ class Graph:
                     lo, hi = (_constant(_expression(part, line, node_count)) for part in bounds.groups())
                     if lo >= hi:
                         raise _error(line, 'range lower bound must be less than upper bound')
-                    if name in ('axisx', 'axisy'):
-                        axes[name] = (lo, hi)
+                    axis = _AXIS_DECLARATIONS.get(name)
+                    if axis is None and name in ('x', 'y'):
+                        axis = name
+                    if axis is not None:
+                        axes[axis] = (lo, hi)
+                        self.axis_ranges[axis] = (lo, hi)
+                        self.axis_views[axis] = (lo, hi)
                     else:
                         if name in self.ranges or name in definitions:
                             raise _error(line, f'duplicate range or formula for {name}')
@@ -234,7 +305,7 @@ class Graph:
                         self.ranges[name] = (lo, hi)
                         self.values[name] = lo / 2 + hi / 2
                 else:
-                    if name in ('axisx', 'axisy'):
+                    if name in _AXIS_DECLARATIONS:
                         raise _error(line, f'{name} requires a range')
                     expression = _expression(text, line, node_count)
                     if name in self.ranges:
@@ -249,30 +320,14 @@ class Graph:
         if not self.plots:
             raise _error(max(1, len(lines)), 'at least one plot is required')
         for plot in self.plots:
-            if not plot.curves:
-                raise _error(plot.line, f'no formula defined for {plot.output}')
-            self._validate(plot.definitions)
-            for name in (plot.sweep,) + plot.parameters:
-                if name not in self.ranges:
-                    raise _error(plot.line, f'{name} must have a declared range')
-            dependencies = set()
-
-            def collect(expression):
-                for name in sorted(expression.names):
-                    if name in dependencies:
-                        continue
-                    dependencies.add(name)
-                    if name not in self.ranges:
-                        collect(plot.definitions[name][-1])
-
-            for curve in plot.curves:
-                collect(curve)
-            controls = list(dict.fromkeys((plot.sweep,) + plot.parameters))
-            controls.extend(name for name in self.ranges if name in dependencies and name not in controls)
-            plot.controls = tuple(controls)
+            if plot.old:
+                self._finalize_old_plot(plot)
+            else:
+                self._finalize_new_plot(plot)
         for name, value in initial.items():
             lo, hi = self.ranges[name]
             self.values[name] = max(lo, min(hi, value))
+        self._add_axis_controls()
         if isinstance(values, Mapping):
             for name in self.ranges:
                 value = values.get(name)
@@ -285,38 +340,319 @@ class Graph:
                 if math.isfinite(value):
                     lo, hi = self.ranges[name]
                     self.values[name] = max(lo, min(hi, value))
+        self._sync_axis_views()
+
+    # ------------------------------------------------------------------
+    # parsing helpers
+
+    def _parse_plot(self, kind, body, line, definitions, axes, node_count):
+        args = _split_args(body)
+        if kind == 'plotxy':
+            if len(args) != 2 or not all(args):
+                raise _error(line, 'use plotxy(x_expression, y_expression)')
+        else:
+            if not 1 <= len(args) <= 18 or not all(args):
+                raise _error(line, 'use plot(expression, optional_expressions...)')
+        if len(self.plots) >= 8:
+            raise _error(line, 'at most 8 plots are allowed')
+        old = (kind == 'plot' and len(args) >= 2
+               and all(re.fullmatch(_NAME, arg) for arg in args)
+               and args[0] in definitions and args[1] in self.ranges)
+        if old:
+            output, sweep = args[0], args[1]
+            if len(set(args)) != len(args):
+                raise _error(line, 'plot names must be distinct')
+            parameters = tuple(args[2:])
+            variants = definitions[output]
+            old_domain = axes.get('x', self.ranges[sweep])
+            curves = tuple(_Curve(label=f'{output}#{index + 1}',
+                                  expression=expression, name=output,
+                                  variant=index, sweep=sweep, domain=old_domain,
+                                  line=expression.line)
+                           for index, expression in enumerate(variants))
+            self.plots.append(_Plot(output, sweep, parameters,
+                                    {k: tuple(v) for k, v in definitions.items()},
+                                    curves, dict(axes), line, old=True))
+            return
+        specs = [self._plot_spec(arg, line, definitions, node_count) for arg in args]
+        if kind == 'plotxy':
+            xspec, yspec = specs
+            curve = _Curve(label=f'{xspec["label"]},{yspec["label"]}',
+                           kind='parametric', xexpr=xspec['expr'], xname=xspec['name'],
+                           yexpr=yspec['expr'], yname=yspec['name'], line=line)
+            curves = (curve,)
+            output = curve.label
+        else:
+            curves = tuple(self._curve_from_spec(spec, line, definitions) for spec in specs)
+            output = ','.join(spec['label'] for spec in specs)
+        definitions_snapshot = {k: tuple(v) for k, v in definitions.items()}
+        self.plots.append(_Plot(output, '', tuple(), definitions_snapshot,
+                                curves, dict(axes), line))
+
+    def _plot_spec(self, text, line, definitions, node_count):
+        if re.fullmatch(_NAME, text) and text in definitions:
+            variants = definitions[text]
+            return {'label': text, 'name': text, 'expr': variants[-1]}
+        return {'label': text, 'name': None,
+                'expr': _expression(text, line, node_count)}
+
+    def _curve_from_spec(self, spec, line, definitions):
+        expression = spec['expr']
+        name = spec['name']
+        label = spec['label']
+        free = set(expression.names)
+        if name is not None:
+            free.discard(name)
+        if 'x' in free and 'y' in free:
+            return _Curve(label=label, kind='implicit', expression=expression,
+                          name=name, line=line)
+        if name == 'x' or ('y' in free and name != 'y'):
+            # x=f(y): x is horizontal, the y plane coordinate is the domain.
+            return _Curve(label=label, expression=expression, name=name,
+                          orientation='x_of_y', sweep='y', sweep_axis='y',
+                          domain=self.axis_ranges.get('y'), line=line)
+        # y=f(x), or an unqualified function of the horizontal x coordinate.
+        return _Curve(label=label, expression=expression, name=name,
+                      orientation='y_of_x', sweep='x', sweep_axis='x',
+                      domain=self.axis_ranges.get('x'), line=line)
+
+    def _curve_ranges(self, plot, curve, skip=()):
+        """Return the ranged variables reachable from a single curve."""
+        used, seen = set(), set()
+
+        def walk_expression(expression, owner=None, index=None):
+            for name in expression.names:
+                if name in skip:
+                    continue
+                if name in self.ranges:
+                    used.add(name)
+                    continue
+                variants = plot.definitions.get(name)
+                if not variants:
+                    continue
+                if owner is not None and name == owner:
+                    next_index = index - 1
+                else:
+                    next_index = len(variants) - 1
+                if next_index >= 0:
+                    walk_definition(name, next_index)
+
+        def walk_definition(name, index):
+            key = (name, index)
+            if key in seen:
+                return
+            seen.add(key)
+            walk_expression(plot.definitions[name][index], name, index)
+
+        if curve.kind == 'parametric':
+            for expression, name in ((curve.xexpr, curve.xname),
+                                     (curve.yexpr, curve.yname)):
+                variants = plot.definitions.get(name) if name else None
+                if variants:
+                    walk_definition(name, len(variants) - 1)
+                else:
+                    walk_expression(expression)
+        elif curve.name:
+            variants = plot.definitions.get(curve.name)
+            if variants:
+                index = len(variants) - 1 if curve.variant is None else curve.variant
+                walk_definition(curve.name, index)
+            else:
+                walk_expression(curve.expression)
+        else:
+            walk_expression(curve.expression)
+        return [name for name in self.ranges if name in used]
+
+    def _finalize_old_plot(self, plot):
+        if not plot.curves:
+            raise _error(plot.line, f'no formula defined for {plot.output}')
+        for name in (plot.sweep,) + plot.parameters:
+            if name not in self.ranges:
+                raise _error(plot.line, f'{name} must have a declared range')
+        dependencies = set()
+
+        def collect(expression):
+            for name in sorted(expression.names):
+                if name in dependencies:
+                    continue
+                dependencies.add(name)
+                if name not in self.ranges and name in plot.definitions:
+                    collect(plot.definitions[name][-1])
+
+        for curve in plot.curves:
+            collect(curve.expression)
+        controls = list(dict.fromkeys((plot.sweep,) + plot.parameters))
+        controls.extend(name for name in self.ranges
+                        if name in dependencies and name not in controls)
+        plot.controls = tuple(controls)
+
+    def _finalize_new_plot(self, plot):
+        if len(plot.curves) == 1 and plot.curves[0].kind == 'parametric':
+            curve = plot.curves[0]
+            used = self._curve_ranges(plot, curve)
+            if used:
+                curve.sweep = used[0]
+                curve.domain = self.ranges[curve.sweep]
+            else:
+                curve.sweep = None
+                curve.domain = self.axis_ranges.get('x', (0.0, 1.0))
+            plot.sweep = curve.sweep or ''
+            plot.sweep_axis = curve.sweep_axis
+            plot.controls = tuple(used)
+            return
+        used = set()
+        for curve in plot.curves:
+            if curve.kind == 'implicit':
+                skip = {'x', 'y'}
+            elif curve.sweep in ('x', 'y'):
+                skip = {curve.sweep}
+            else:
+                skip = set()
+            used.update(self._curve_ranges(plot, curve, skip))
+        order = [name for name in self.ranges if name in used]
+        sweep = next((c.sweep for c in plot.curves if c.sweep), None)
+        plot.sweep = sweep or ''
+        plot.sweep_axis = next((c.sweep_axis for c in plot.curves
+                                if c.sweep == sweep), 'x')
+        plot.controls = tuple(order)
+
+    def _add_axis_controls(self):
+        for axis in ('x', 'y'):
+            base = self.axis_ranges.get(axis)
+            if base is None:
+                continue
+            lo, hi = self.axis_views[axis]
+            for suffix, part in _AXIS_CONTROL_SUFFIX.items():
+                name = f'{axis}_axis{suffix}'
+                self.axis_controls[name] = (axis, part)
+                self.ranges[name] = base
+                self.values[name] = lo if part == 0 else hi
+
+    def _sync_axis_views(self):
+        for axis in ('x', 'y'):
+            min_name = f'{axis}_axis.min'
+            max_name = f'{axis}_axis.max'
+            if min_name not in self.values or max_name not in self.values:
+                continue
+            lo, hi = self.values[min_name], self.values[max_name]
+            if lo > hi:
+                lo, hi = hi, lo
+            if lo == hi:
+                hi = lo + max(1e-9, abs(lo) * 1e-9)
+            self.axis_views[axis] = (lo, hi)
+            self.values[min_name] = lo
+            self.values[max_name] = hi
+            for plot in self.plots:
+                plot.axes[axis] = (lo, hi)
+
+    # ------------------------------------------------------------------
+    # validation and evaluation
 
     def _validate(self, definitions):
         depths, active = {}, set()
 
-        def visit(name, line, depth):
+        def visit(name, line, depth, index=None):
             if name in self.ranges:
+                return 0
+            if name in ('x', 'y') and index is None:
                 return 0
             if name not in definitions:
                 raise _error(line, f'unknown name {name}')
-            if name in active:
+            variants = definitions[name]
+            if index is None:
+                index = len(variants) - 1
+            if index < 0:
+                raise _error(line, f'circular dependency involving {name}')
+            key = (name, index)
+            if key in active:
                 raise _error(line, f'circular dependency involving {name}')
             if depth > 24:
                 raise _error(line, 'dependency depth exceeds 24')
-            if name in depths:
-                if depth + depths[name] - 1 > 24:
+            if key in depths:
+                if depth + depths[key] - 1 > 24:
                     raise _error(line, 'dependency depth exceeds 24')
-                return depths[name]
-            active.add(name)
-            expression = definitions[name][-1]
+                return depths[key]
+            active.add(key)
+            expression = variants[index]
             height = 1
             for dependency in sorted(expression.names):
-                height = max(height, 1 + visit(dependency, expression.line, depth + 1))
-            active.remove(name)
-            depths[name] = height
+                next_index = index - 1 if dependency == name else None
+                height = max(height, 1 + visit(dependency, expression.line,
+                                               depth + 1, next_index))
+            active.remove(key)
+            depths[key] = height
             return height
 
         for name, variants in definitions.items():
             visit(name, variants[-1].line, 1)
             # Earlier output variants are still executable curves.
-            for expression in variants:
+            for index, expression in enumerate(variants):
                 for dependency in sorted(expression.names):
-                    visit(dependency, expression.line, 1)
+                    next_index = index - 1 if dependency == name else None
+                    visit(dependency, expression.line, 1, next_index)
+
+    def _resolver(self, plot, cache, budget):
+        def resolve(name, index=None):
+            if index is None:
+                if name in cache:
+                    return cache[name]
+                variants = plot.definitions.get(name)
+                if not variants:
+                    raise ValueError(f'unknown name {name}')
+                index = len(variants) - 1
+            key = (name, index)
+            if key in cache:
+                return cache[key]
+            variants = plot.definitions.get(name)
+            if not variants or index < 0:
+                raise ValueError(f'circular dependency involving {name}')
+            expression = variants[index]
+
+            def inner(inner_name):
+                if inner_name == name:
+                    return resolve(name, index - 1)
+                return resolve(inner_name)
+
+            value = _evaluate(expression.node, inner, budget)
+            cache[key] = value
+            return value
+
+        def value(expression, name=None, variant=None):
+            if name is not None:
+                return resolve(name, variant)
+            return _evaluate(expression.node, lambda n: resolve(n), budget)
+
+        return value
+
+    def _eval_curve(self, plot, curve, u, budget):
+        cache = dict(self.values)
+        if curve.sweep:
+            cache[curve.sweep] = u
+        value = self._resolver(plot, cache, budget)
+        try:
+            if curve.kind == 'parametric':
+                x = value(curve.xexpr, curve.xname)
+                y = value(curve.yexpr, curve.yname)
+                return (x, y)
+            result = value(curve.expression, curve.name, curve.variant)
+            if curve.orientation == 'x_of_y':
+                return (result, u)
+            return (u, result)
+        except (ArithmeticError, ValueError, RecursionError):
+            return None
+
+    def _eval_implicit(self, plot, curve, x, y, budget):
+        cache = dict(self.values)
+        cache['x'] = x
+        cache['y'] = y
+        value = self._resolver(plot, cache, budget)
+        try:
+            return value(curve.expression, curve.name)
+        except (ArithmeticError, ValueError, RecursionError):
+            return None
+
+    # ------------------------------------------------------------------
+    # public API
 
     def _plot(self, index):
         if type(index) is not int or not 0 <= index < len(self.plots):
@@ -326,9 +662,11 @@ class Graph:
     def controls(self, plot_index=0):
         return list(self._plot(plot_index).controls)
 
+    def sliders(self, plot_index=0):
+        """Variable controls followed by the axis-range handles."""
+        return self.controls(plot_index) + list(self.axis_controls)
+
     def adjust(self, name, fraction):
-        if name not in self.ranges:
-            raise ValueError(f'unknown ranged variable {name}')
         if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
             raise ValueError('fraction must be finite')
         try:
@@ -338,24 +676,90 @@ class Graph:
         if not math.isfinite(fraction):
             raise ValueError('fraction must be finite')
         fraction = max(0.0, min(1.0, fraction))
+        if name in self.axis_controls:
+            axis, part = self.axis_controls[name]
+            lo, hi = self.axis_ranges[axis]
+            target = lo * (1 - fraction) + hi * fraction
+            view = list(self.axis_views[axis])
+            margin = max(1e-9, abs(hi - lo) * 1e-6)
+            if part == 0:
+                view[0] = min(target, view[1] - margin)
+            else:
+                view[1] = max(target, view[0] + margin)
+            self.axis_views[axis] = (view[0], view[1])
+            self.values[f'{axis}_axis.min'] = view[0]
+            self.values[f'{axis}_axis.max'] = view[1]
+            for plot in self.plots:
+                plot.axes[axis] = (view[0], view[1])
+            return
+        if name not in self.ranges:
+            raise ValueError(f'unknown ranged variable {name}')
         lo, hi = self.ranges[name]
         self.values[name] = lo * (1 - fraction) + hi * fraction
 
-    def _sample(self, plot, expression, sweep, budget):
-        cache = {**self.values, plot.sweep: sweep}
+    # ------------------------------------------------------------------
+    # rendering
 
-        def resolve(name):
-            if name not in cache:
-                cache[name] = _evaluate(plot.definitions[name][-1].node, resolve, budget)
-            return cache[name]
+    def _domain(self, curve, plot, x_bounds=None):
+        domain = curve.domain
+        if domain is None:
+            if curve.orientation == 'x_of_y':
+                domain = plot.axes.get('y') or self.axis_ranges.get('y')
+            else:
+                domain = plot.axes.get('x') or self.axis_ranges.get('x')
+        if domain is None:
+            domain = (-1.0, 1.0)
+        return domain
 
-        try:
-            return _evaluate(expression.node, resolve, budget)
-        except (ArithmeticError, ValueError, RecursionError):
-            return None
+    def _sample_points(self, plot, curve, nx, budget):
+        domain = self._domain(curve, plot)
+        lo, hi = domain
+        points = []
+        for i in range(nx):
+            u = lo * (1 - i / (nx - 1)) + hi * (i / (nx - 1))
+            try:
+                point = self._eval_curve(plot, curve, u, budget)
+            except _BudgetExceeded:
+                raise
+            points.append(point)
+        return points, (lo, hi)
+
+    def _implicit_points(self, plot, curve, bounds, nx, ny, budget):
+        xlo, xhi, ylo, yhi = bounds
+        columns = max(2, min(120, nx))
+        rows = max(2, min(90, ny))
+        grid = []
+        for j in range(rows + 1):
+            y = yhi - (yhi - ylo) * j / rows
+            row = []
+            for i in range(columns + 1):
+                x = xlo + (xhi - xlo) * i / columns
+                try:
+                    row.append(self._eval_implicit(plot, curve, x, y, budget))
+                except _BudgetExceeded:
+                    raise
+            grid.append(row)
+        points = []
+        for j in range(rows):
+            for i in range(columns):
+                corners = (grid[j][i], grid[j][i + 1],
+                           grid[j + 1][i], grid[j + 1][i + 1])
+                if any(value is not None and value == 0 for value in corners):
+                    x = xlo + (xhi - xlo) * (i + .5) / columns
+                    y = yhi - (yhi - ylo) * (j + .5) / rows
+                    points.append((x, y))
+                    continue
+                finite = [value for value in corners if value is not None]
+                if len(finite) < 2:
+                    continue
+                if min(finite) < 0 < max(finite):
+                    x = xlo + (xhi - xlo) * (i + .5) / columns
+                    y = yhi - (yhi - ylo) * (j + .5) / rows
+                    points.append((x, y))
+        return points
 
     def render(self, width, height, plot_index=0):
-        """Draw within the supplied viewport; axisx overrides horizontal bounds.
+        """Draw within the supplied viewport using the current axis views.
 
         Domain/overflow errors leave gaps. Large adjacent jumps are not joined.
         An exhausted shared operation budget leaves gaps and a visible notice.
@@ -371,51 +775,79 @@ class Graph:
         def styled(text, color=MUTED):
             return color + text[:width] + BASE
 
-        legend = f'{plot.output} vs {plot.sweep} | '
+        labels = [curve.label for curve in plot.curves]
+        legend = (f'{plot.output} vs {plot.sweep} | ' if plot.old
+                  else ' | '.join(labels))
         title = ACCENT + legend[:width]
         used = min(width, len(legend))
-        for index, expression in enumerate(plot.curves):
-            label = f'{plot.output}#{index + 1}(L{expression.line}) '
-            title += _PALETTE[index % len(_PALETTE)] + label[:max(0, width - used)]
-            used = min(width, used + len(label))
+        if len(labels) > 1 or plot.old:
+            for index, label in enumerate(labels):
+                extra = f'{label}(L{plot.curves[index].line}) '
+                title += _PALETTE[index % len(_PALETTE)] + extra[:max(0, width - used)]
+                used = min(width, used + len(extra))
         rows = [title + BASE]
         if height == 1:
             return rows
-        lo, hi = self.ranges[plot.sweep]
-        if 'axisx' in plot.axes:
-            lo, hi = plot.axes['axisx']
-        empty = lo >= hi
         budget = [200000]
         exhausted = False
         drawing_height = max(0, height - 3)
         margin = 10 if width >= 24 else 0
         cols = width - margin
         nx, ny = max(2, cols * 2), max(4, drawing_height * 4)
-        samples = []
-        all_y = []
-        if not empty and drawing_height:
-            for expression in plot.curves:
-                curve = []
-                for i in range(nx):
-                    t = lo * (1 - i / (nx - 1)) + hi * (i / (nx - 1))
-                    try:
-                        value = self._sample(plot, expression, t, budget)
-                    except _BudgetExceeded:
-                        exhausted = True
-                        value = None
-                    curve.append(value)
-                    if value is not None:
-                        all_y.append(value)
-                samples.append(curve)
-        if 'axisy' in plot.axes:
-            bottom, top = plot.axes['axisy']
-        elif all_y:
-            bottom, top = min(all_y), max(all_y)
-            pad = max(abs(bottom) * .05, 1.0) if bottom == top else (top - bottom) * .08
-            bottom, top = max(-_LIMIT, bottom - pad), min(_LIMIT, top + pad)
-        else:
-            bottom, top = -1.0, 1.0
-        span = top - bottom
+        sampled = []
+        xs, ys = [], []
+        if drawing_height:
+            for curve in plot.curves:
+                if curve.kind == 'implicit':
+                    continue
+                try:
+                    points, domain = self._sample_points(plot, curve, nx, budget)
+                except _BudgetExceeded:
+                    exhausted = True
+                    points, domain = [], self._domain(curve, plot)
+                for point in points:
+                    if point is None:
+                        continue
+                    x, y = point
+                    if math.isfinite(x) and math.isfinite(y):
+                        xs.append(x)
+                        ys.append(y)
+                sampled.append((curve, points, False))
+        x_bounds = plot.axes.get('x')
+        y_bounds = plot.axes.get('y')
+        if x_bounds is None:
+            if xs:
+                xlo, xhi = min(xs), max(xs)
+                pad = max(abs(xlo) * .05, 1.0) if xlo == xhi else (xhi - xlo) * .08
+                x_bounds = (xlo - pad, xhi + pad)
+            else:
+                x_bounds = self.axis_ranges.get('x', (-1.0, 1.0))
+        if y_bounds is None:
+            if ys:
+                ylo, yhi = min(ys), max(ys)
+                pad = max(abs(ylo) * .05, 1.0) if ylo == yhi else (yhi - ylo) * .08
+                y_bounds = (ylo - pad, yhi + pad)
+            elif 'y' in self.axis_ranges:
+                y_bounds = self.axis_ranges['y']
+            elif x_bounds:
+                y_bounds = x_bounds
+            else:
+                y_bounds = (-1.0, 1.0)
+        xlo, xhi = x_bounds
+        ylo, yhi = y_bounds
+        empty = xlo >= xhi or ylo >= yhi
+        if drawing_height and not empty:
+            for curve in plot.curves:
+                if curve.kind != 'implicit':
+                    continue
+                try:
+                    points = self._implicit_points(plot, curve, (xlo, xhi, ylo, yhi),
+                                                   nx, ny, budget)
+                except _BudgetExceeded:
+                    exhausted = True
+                    points = []
+                sampled.append((curve, points, True))
+        xspan, yspan = xhi - xlo, yhi - ylo
         bits = [[0] * cols for _ in range(drawing_height)]
         colors = [[BORDER] * cols for _ in range(drawing_height)]
 
@@ -425,42 +857,57 @@ class Graph:
                 bits[row][col] |= _DOTS[y % 4][x % 2]
                 colors[row][col] = color
 
+        def pixel_x(value):
+            return round((value - xlo) / xspan * (nx - 1)) if xspan else 0
+
         def pixel_y(value):
-            return round((top - value) / span * (ny - 1))
+            return round((yhi - value) / yspan * (ny - 1)) if yspan else 0
 
         if drawing_height and not empty:
-            if bottom <= 0 <= top:
+            if ylo <= 0 <= yhi:
                 y = pixel_y(0)
                 for x in range(nx):
                     dot(x, y, BORDER)
-            if lo <= 0 <= hi:
-                x = round((0 - lo) / (hi - lo) * (nx - 1))
+            if xlo <= 0 <= xhi:
+                x = pixel_x(0)
                 for y in range(ny):
                     dot(x, y, BORDER)
-            playhead = self.values[plot.sweep]
-            if lo <= playhead <= hi:
-                x = round((playhead - lo) / (hi - lo) * (nx - 1))
-                for y in range(0, ny, 4):
-                    dot(x, y, MUTED)
-            for index, curve in enumerate(samples):
-                previous = None
+            if plot.sweep and plot.sweep in self.values:
+                playhead = self.values[plot.sweep]
+                if plot.sweep_axis == 'y' and ylo <= playhead <= yhi:
+                    y = pixel_y(playhead)
+                    for x in range(0, nx, 4):
+                        dot(x, y, MUTED)
+                elif xlo <= playhead <= xhi:
+                    x = pixel_x(playhead)
+                    for y in range(0, ny, 4):
+                        dot(x, y, MUTED)
+            for index, (curve, points, discrete) in enumerate(sampled):
                 color = _PALETTE[index % len(_PALETTE)]
-                for x, value in enumerate(curve):
-                    if value is None or not bottom <= value <= top:
+                previous = None
+                for point in points:
+                    if point is None:
                         previous = None
                         continue
-                    y = pixel_y(value)
-                    dot(x, y, color)
-                    # Do not connect poles or jumps across a substantial axis span.
-                    if previous is not None and abs(y - previous) <= max(2, ny // 4):
-                        distance = abs(y - previous)
-                        for step in range(1, distance):
-                            dot(x, previous + (1 if y > previous else -1) * step, color)
-                    previous = y
+                    x, y = point
+                    if not (math.isfinite(x) and math.isfinite(y)):
+                        previous = None
+                        continue
+                    if not (xlo <= x <= xhi and ylo <= y <= yhi):
+                        previous = None
+                        continue
+                    px, py = pixel_x(x), pixel_y(y)
+                    dot(px, py, color)
+                    if not discrete and previous is not None:
+                        if abs(py - previous) <= max(2, ny // 4):
+                            distance = abs(py - previous)
+                            for step in range(1, distance):
+                                dot(px, previous + (1 if py > previous else -1) * step, color)
+                    previous = py if not discrete else None
         for row in range(drawing_height):
             prefix = ''
             if margin:
-                label = f'{top:.3g}' if row == 0 else f'{bottom:.3g}' if row == drawing_height - 1 else ''
+                label = f'{yhi:.3g}' if row == 0 else f'{ylo:.3g}' if row == drawing_height - 1 else ''
                 prefix = MUTED + label[:margin - 1].rjust(margin - 1) + ' '
             rendered = prefix
             last_color = None
@@ -472,23 +919,34 @@ class Graph:
                 rendered += chr(0x2800 + bits[row][col]) if bits[row][col] else ' '
             rows.append(rendered + BASE)
         if height >= 3:
-            left = f'{lo:.4g}' if not empty else 'axisx outside sweep range'
-            right = f'{hi:.4g} {plot.sweep}' if not empty else ''
+            left = f'{xlo:.4g}' if not empty else 'axes outside range'
+            right = f'{xhi:.4g} {plot.sweep if plot.old else "x"}' if not empty else ''
             label = left + ' ' * max(1, cols - len(left) - len(right)) + right
             rows.append(styled(' ' * margin + label))
-        readout = f'{plot.sweep}={self.values[plot.sweep]:.4g}'
-        for index, expression in enumerate(plot.curves):
-            try:
-                value = self._sample(plot, expression, self.values[plot.sweep], budget)
-            except _BudgetExceeded:
-                exhausted = True
-                value = None
-            readout += f' {plot.output}#{index + 1}=' + (f'{value:.4g}' if value is not None else 'gap')
+        if plot.old:
+            readout = f'{plot.sweep}={self.values[plot.sweep]:.4g}'
+            for curve in plot.curves:
+                try:
+                    point = self._eval_curve(plot, curve, self.values[plot.sweep], budget)
+                except _BudgetExceeded:
+                    exhausted = True
+                    point = None
+                value = None if point is None else point[1]
+                readout += f' {curve.label}=' + (f'{value:.4g}' if value is not None else 'gap')
+        else:
+            names = [name for name in plot.controls
+                     if name not in self.axis_controls and name != plot.sweep]
+            readout = ' '.join(f'{name}={self.values[name]:.4g}' for name in names)
+            if plot.sweep and plot.sweep in self.values:
+                prefix = f'{plot.sweep}={self.values[plot.sweep]:.4g}'
+                readout = prefix + ((' | ' + readout) if readout else '')
+            if not readout:
+                readout = 'x/y graph'
         if exhausted:
             readout = 'budget limit | ' + readout
         elif empty:
             readout = 'empty axis | ' + readout
-        elif drawing_height and not all_y:
+        elif drawing_height and not xs and not any(c.kind == 'implicit' for c in plot.curves):
             readout = 'no finite samples | ' + readout
         rows.append(styled(readout, WARNING if exhausted or empty else ACCENT))
         return rows[:height]

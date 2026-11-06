@@ -360,19 +360,21 @@ Ctrl+S retries saving after a transient filesystem error.
 ### Interactive note graphs
 
 In `/notes`, type `/graph` on its own line and press Enter. Pry inserts a complete
-example into `notes.md` and opens an interactive Braille graph with two curves:
+example into `notes.md` and opens an interactive Braille graph:
 
 ```graph
-xaxis=[0..1]
+x_axis=[-2..2]
+y_axis=[-2..2]
+a=[-1..1]
+a=1
+y=sin(x*tau)*a
+plot(y)
 t=[0..1]
-t=0
-amp=[-2..2]
-amp=0
-a=sin(2*pi*(xaxis-t))+amp
-x=a
-x=cos(2*pi*(xaxis-t))+amp
-axisy=[-3..3]
-plot(x,xaxis,t,amp)
+plotxy(cos(t*tau),sin(t*tau))
+r=[0..2]
+r=1
+f=x^2+y^2-r^2
+plot(f)
 ```
 
 Graph blocks are ordinary fenced Markdown using the `graph` language tag. Each
@@ -382,28 +384,34 @@ Tab/Shift+Tab or Up/Down selects a slider; Left/Right changes it by 1% of its ra
 and Home/End selects a bound. Click or drag a slider track to set its value.
 Esc returns to notes; `e` returns to editing the graph's expressions.
 
-`plot(output,sweep,parameters...)` sweeps the horizontal variable across its
-declared range. Its slider moves a playhead, with corresponding curve values
-shown below the graph. Other sliders reshape the curves. Ranged dependencies
-are inferred as sliders even if omitted from the plot's argument list. In the
-example, `xaxis` is the independent horizontal variable, `t` shifts the curves
-horizontally, and `amp` shifts them vertically. The `xaxis` slider moves only the
-playhead. Changing `xaxis=[lo..hi]` changes the plotted horizontal range.
-Optionally add `axisx=[lo..hi]` to override the visible horizontal bounds; when
-present it takes precedence over the sweep range. Remove that override if you
-want the graph to follow the `xaxis` range directly.
-Repeated output assignments create separate colored curves. Each plot uses the
-formulas and axis bounds preceding it; dependencies use the last definition in
-that snapshot. Add more `plot(...)` statements for additional previews; `[` and
-`]` switch plots in the expanded view. Slider values persist in `pry-state.json`,
-keyed by block contents, so editing a block resets its controls to its defaults.
+Set the visible plane with `x_axis=[lo..hi]` and `y_axis=[lo..hi]` (the older
+`axisx`/`axisy` names also work). The axis ranges appear as two handles each, so
+you can zoom or pan without editing the note.
+
+`plot(expression)` derives everything else. A `y` expression uses `x` as the
+horizontal domain, an `x` expression uses `y`, and an expression containing both
+`x` and `y` is drawn as an implicit curve `f(x,y)=0`. Any ranged variable used
+by the expression becomes a slider. `plot(x,y,...)` draws several functions on
+the same axes, and `plotxy(x,y)` draws a parametric curve, using the first ranged
+variable it finds as the parameter. For example, `y=sin(x*tau)*a` is a normal
+`y=f(x)` plot with `a` as a slider, while `plotxy(cos(t*tau),sin(t*tau))` sweeps
+`t` around a circle.
+
+The older explicit form `plot(output,sweep,parameters...)` remains supported:
+it sweeps the horizontal variable across its declared range, with a playhead
+slider and inferred parameter sliders. Repeated output assignments create
+separate colored curves. Each plot uses the formulas and axis bounds preceding
+it; dependencies use the last definition in that snapshot. A definition may
+refer to its own previous value. Add more `plot(...)` statements for additional
+previews; `[` and `]` switch plots in the expanded view. Slider values persist in
+`pry-state.json`, keyed by block contents, so editing a block resets its controls
+to its defaults.
 
 Use `[lo..hi]` to declare ranges, and a subsequent constant assignment to set a
-slider's initial value (otherwise it starts at the midpoint). `axisx` overrides
-the horizontal bounds; `axisy` sets vertical bounds. Without `axisx`, the sweep
-range is used; without `axisy`, vertical bounds are calculated automatically.
+slider's initial value (otherwise it starts at the midpoint). Without explicit
+axis bounds, ranges are calculated from the sampled curve.
 Arithmetic supports `+ - * / % **` and `^` for powers, parentheses, `pi`, `e`,
-`tau`, and functions including `sin`, `cos`, `tan`, `sqrt`, `log`, `exp`, `abs`,
+`tau` (or uppercase `PI`, `E`, `TAU`), and functions including `sin`, `cos`, `tan`, `sqrt`, `log`, `exp`, `abs`,
 `min`, and `max`. Statements can be on separate lines or separated by semicolons;
 `#` starts a comment. Invalid expressions show a line-specific error. Domain
 errors produce gaps. Evaluation is bounded and does not execute Python code.

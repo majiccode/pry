@@ -836,7 +836,7 @@ class ScratchpadPanel:
     def graph_event(self, event, value):
         key, source, index = self.graph_focus
         graph = self.graph(key, source)
-        controls = graph.controls(index)
+        controls = graph.sliders(index)
         if event == 'escape' or event == 'key' and value in ('\x03', 'e', '\r'):
             self.graph_focus = None
             if event == 'key' and value == 'e':
@@ -846,12 +846,15 @@ class ScratchpadPanel:
                     self.selection = self.anchor = None
                     self.follow = True
             return
+        if event == 'key' and value in ('[', ']'):
+            self.graph_focus = (key, source, (index + (1 if value == ']' else -1)) % len(graph.plots))
+            self.graph_slider = 0
+            return
+        if not controls:
+            return
         if event in ('pane', 'scroll') or event == 'key' and value == '\t':
             step = -1 if event == 'pane' else value if event == 'scroll' else 1
             self.graph_slider = (self.graph_slider + step) % len(controls)
-        elif event == 'key' and value in ('[', ']'):
-            self.graph_focus = (key, source, (index + (1 if value == ']' else -1)) % len(graph.plots))
-            self.graph_slider = 0
         elif event in ('cursor', 'home', 'end'):
             name = controls[self.graph_slider]
             lo, hi = graph.ranges[name]
@@ -872,7 +875,7 @@ class ScratchpadPanel:
     def draw_graph(self, cols, rows, wrap, top):
         key, source, index = self.graph_focus
         graph = self.graph(key, source)
-        controls = graph.controls(index)
+        controls = graph.sliders(index)
         output = ['\033[?25l']
         self.graph_zones = []
 
@@ -893,7 +896,8 @@ class ScratchpadPanel:
         for number, name in enumerate(controls[first:first + slider_rows], first):
             lo, hi = graph.ranges[name]
             value = graph.values[name]
-            prefix = f'{">" if number == self.graph_slider else " "} {name}={value:.4g} '
+            label = name.replace('.', ' ') if name in graph.axis_controls else name
+            prefix = f'{">" if number == self.graph_slider else " "} {label}={value:.4g} '
             suffix = f' [{lo:.4g}..{hi:.4g}]'
             track_width = max(1, cols - len(prefix) - len(suffix))
             position = round((value - lo) / (hi - lo) * (track_width - 1))
@@ -901,7 +905,7 @@ class ScratchpadPanel:
             row = top + 2 + graph_height + number - first
             put(row, prefix + track + suffix, ACCENT if number == self.graph_slider else MUTED)
             self.graph_zones.append((row, len(prefix) + 1, len(prefix) + track_width, number))
-        put(rows - 1, self.message if self.message.startswith('Could not') else ' Sweep slider moves the playhead; parameters reshape the curves.', MUTED)
+        put(rows - 1, self.message if self.message.startswith('Could not') else ' Parameters reshape curves; axis handles set the visible x/y range.', MUTED)
         put(rows, ' Tab/Up/Down slider | Left/Right adjust | Home/End bounds | e edit | Esc close', MUTED)
         return ''.join(output)
 
