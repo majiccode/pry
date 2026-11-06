@@ -709,7 +709,7 @@ class ScratchpadPanel:
         saved['page'] = page
         self.inspector.blocks = [b for b in self.inspector.blocks if b['id'] != saved['id']]
         self.inspector.blocks.append(saved)
-        self.cursor = start
+        self.cursor = min(saved['end'], len(self.text))
         self.follow = True
         self.save_position()
 
@@ -1078,10 +1078,9 @@ class ScratchpadPanel:
                 if self.inspector.pane == 'preview':
                     self.inspector.event(event, value, self.open_url)
                     return
-                # Cancel the inspection: close without saving any navigated-to
-                # page over the block's original page, so the inspector restores
-                # to the original location it was opened at.
-                self.inspector.close()
+                # Autosave the current view into the block's fence and leave the
+                # cursor after the saved output so typing continues below it.
+                self.finish_inspection()
                 return
             if event == 'click':
                 x, y = value
@@ -1514,7 +1513,7 @@ class ScratchpadPanel:
         self.measure_cache[key] = (count, used)
         return count, used
 
-    def draw(self, cols, rows, wrap, styles, top=1):
+    def draw(self, cols, rows, wrap, styles, top=1, _settled=False):
         self.hit_rows = {}
         self.zones = []
         self.raw_lines = set()
@@ -1790,11 +1789,17 @@ class ScratchpadPanel:
         self.height = max(1, rows - first_row)
         self.max_offset = max(0, len(physical) - self.height)
         if self.inspector.focus is not None:
+            # Keep the focused inspector anchored while its preview changes
+            # height. Allow the viewport past max_offset so the anchor does not
+            # shift to the end of the note and make the panel appear to scroll.
             self.offset = max(0, cursor_row - 1)
-        if self.follow and not self.offset <= cursor_row < self.offset + self.height:
-            self.offset = max(0, cursor_row if cursor_row < self.offset
-                              else cursor_row - self.height + 1)
-        self.offset = min(self.offset, self.max_offset)
+        else:
+            if self.follow and not self.offset <= cursor_row < self.offset + self.height:
+                self.offset = max(0, cursor_row if cursor_row < self.offset
+                                  else cursor_row - self.height + 1)
+            self.offset = min(self.offset, self.max_offset)
+        if self.offset != viewport_start and not _settled:
+            return self.draw(cols, rows, wrap, styles, top, _settled=True)
         window = physical[self.offset:self.offset + self.height]
         for index, (value, left, right, spans, links) in enumerate(window):
             row = first_row + index
