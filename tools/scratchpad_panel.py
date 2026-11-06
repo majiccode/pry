@@ -36,6 +36,9 @@ SGR = re.compile(r'\033\[[0-9;]*m')
 ANSI = re.compile(r'\033(?:\[[0-?]*[ -/]*[@-~]|\][^\007]*(?:\007|\033\\)|[@-_])')
 LINK = re.compile(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>]+', re.IGNORECASE)
 
+# After the user stops interacting, animation resumes after this many seconds of idle.
+GRAPH_IDLE_THRESHOLD = 0.25
+
 
 class ScratchpadPanel:
     def __init__(self, path, cells, clipboard_copy=None, clipboard_paste=None, open_url=None,
@@ -100,6 +103,7 @@ class ScratchpadPanel:
         self._graph_blocks_cache = None
         self._folds_version = -1
         self._folds_cache = None
+        self._last_activity = time.monotonic()
         self.graph_slider = 0
         self.graph_zones = []
         self.graph_drag_start = None
@@ -438,9 +442,19 @@ class ScratchpadPanel:
             self._graph_animated = animated
         if self.graph_focus is not None or self._graph_animated:
             now = time.monotonic()
-            if now - self._graph_last_tick >= 1 / 60:
-                self._graph_last_tick = now
-                changed = True
+            # Pause animation while the user is actively scrolling, typing, or clicking.
+            # Resume once they've been idle for GRAPH_IDLE_THRESHOLD seconds.
+            if now - self._last_activity >= GRAPH_IDLE_THRESHOLD:
+                if now - self._graph_last_tick >= 1 / 60:
+                    self._graph_last_tick = now
+                    # Advance the built-in time/dt on every graph so the next
+                    # render draws a new frame. render() itself no longer
+                    # mutates state, so preview cache hits during activity.
+                    for _start, _offset, _end, _key, source in self.graph_blocks():
+                        graph = self.graph(_key, source)
+                        if isinstance(graph, Graph):
+                            graph.tick()
+                    changed = True
         return changed
 
     def start_capture(self, start, end, command):
@@ -1393,6 +1407,7 @@ class ScratchpadPanel:
         return None
 
     def event(self, event, value):
+        self._last_activity = time.monotonic()
         if event == 'function' and value == 1:
             self.toggle_inspector()
             return

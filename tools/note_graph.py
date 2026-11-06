@@ -326,6 +326,7 @@ class Graph:
                             raise _error(line, 'at most 24 curves per name are allowed')
                         variants.append(expression)
         self.values['time'] = 0.0
+        self.values['dt'] = 0.0
         # Also validate unused formulas, rather than silently accepting typos.
         self._validate(definitions)
         if not self.plots:
@@ -818,6 +819,17 @@ class Graph:
             lo, hi = self.ranges[name]
             self.values[name] = max(lo, min(hi, value))
 
+    def tick(self):
+        """Advance the built-in ``time`` (elapsed seconds) and ``dt``
+        (delta since last tick) by one frame. Called only from the panel's
+        idle poll so animation does not run while the user is scrolling or
+        typing."""
+        now = time.monotonic()
+        dt = max(0.0, min(0.25, now - self._last_render))
+        self._last_render = now
+        self.values['time'] = max(0.0, now - self._start)
+        self.values['dt'] = dt
+
     # ------------------------------------------------------------------
     # rendering
 
@@ -896,12 +908,6 @@ class Graph:
         width, height = max(0, min(240, width)), max(0, min(64, height))
         if not width or not height:
             return []
-
-        now = time.monotonic()
-        dt = max(0.0, min(0.25, now - self._last_render))
-        self._last_render = now
-        self.values['time'] = max(0.0, now - self._start)
-        self.values['dt'] = dt
 
         def styled(text, color=MUTED):
             return color + text[:width] + BASE
