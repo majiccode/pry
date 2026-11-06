@@ -333,7 +333,12 @@ class ScratchpadPanel:
                         previewable = False
                 if not is_directory and Path(entry_path).is_file() and not previewable:
                     actions.append(dict(label='Download file',
-                                        target=dict(kind='file_download', path=entry_path)))
+                                        target=dict(kind='file_download', path=entry_path,
+                                                    user_id=owner_id, user_name=owner_name)))
+                elif not is_directory and not is_image and not Path(entry_path).is_file() and owner_id:
+                    actions.append(dict(label='Download file',
+                                        target=dict(kind='file_download', path=entry_path,
+                                                    user_id=owner_id, user_name=owner_name)))
                 page = dict(title=f'{file_name} · file source',
                             entries=[dict(label='Open file', target=entry_target)],
                             actions=actions)
@@ -743,7 +748,8 @@ class ScratchpadPanel:
         actions = []
         if not is_directory:
             actions.append(dict(label='Download file',
-                                target=dict(kind='file_download', path=str(dest))))
+                                target=dict(kind='file_download', path=str(dest),
+                                            user_id=self.user_id, user_name=self.user_name)))
         page = dict(title=f'{path.name} · file source',
                     entries=[dict(label='Open file', target=entry_target)],
                     actions=actions)
@@ -1387,7 +1393,14 @@ class ScratchpadPanel:
             return None
         kind = target.get('kind')
         if kind == 'file_download':
-            self._download_file(target.get('path', ''))
+            path = target.get('path', '')
+            user_id = target.get('user_id', '')
+            if path and Path(path).is_file():
+                self._download_file(path)
+            elif user_id and self.network:
+                self._retrieve_file(user_id, path)
+            else:
+                self.message = 'File is not available locally and no peer is connected.'
             return None
         if kind in ('file_source', 'file_retrieve'):
             path = target.get('path', '')

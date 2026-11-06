@@ -41,6 +41,7 @@ class NoteInspector:
         self.preview_cache = {}
         self.pane = 'list'
         self.action_index = 0
+        self.locked = False
 
     def worker(self, function, callback):
         self.pending += 1
@@ -102,6 +103,7 @@ class NoteInspector:
         self.request += 1
         self.focus = block
         self.page = block['page']
+        self.locked = bool(self.page.get('locked'))
         self.index = max(0, min(index, max(0, len(self.items()) - 1)))
         self.offset = 0
         self.stack = []
@@ -130,6 +132,8 @@ class NoteInspector:
 
     def back(self):
         self.request += 1
+        if self.locked:
+            return
         if self.stack:
             self.page, self.index, self.offset = self.stack.pop()
         elif self.page and self.page.get('up'):
@@ -215,6 +219,8 @@ class NoteInspector:
             return target
 
     def enter(self, open_url):
+        if self.locked:
+            return None
         items = self.items()
         if not items:
             return
@@ -237,6 +243,8 @@ class NoteInspector:
         self.load(target)
 
     def load(self, target, remember=True):
+        if self.locked:
+            return
         self.request += 1
         self.preview_request += 1
         self.preview = None

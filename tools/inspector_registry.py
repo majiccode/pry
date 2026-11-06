@@ -399,7 +399,7 @@ def file_source_page(target, read_text):
                     + ('' if is_directory else 'Use the Retrieve action to fetch it from the peer.'),
                     user_id=user_id, user_name=user_name,
                     is_image=is_image, is_directory=is_directory,
-                    entries=entries)
+                    entries=entries, locked=True)
     mode = info.st_mode
     if stat.S_ISDIR(mode):
         kind = 'directory'
@@ -455,7 +455,7 @@ def file_source_page(target, read_text):
     return page((path.name or str(path)) + ' · file source', '\n'.join(lines),
                 attach=str(path), user_id=user_id, user_name=user_name,
                 is_image=is_image, is_directory=is_directory, mime=mime,
-                file_path=str(path), actions=actions)
+                file_path=str(path), actions=actions, locked=True)
 
 
 def load(target, read_text):
