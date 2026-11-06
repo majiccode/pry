@@ -11,6 +11,7 @@ import queue
 import shlex
 import shutil
 import socket
+import time
 from pathlib import Path
 import re
 import tempfile
@@ -92,6 +93,13 @@ class ScratchpadPanel:
         self.graph_cache = {}
         self.graph_render_cache = {}
         self.graph_focus = None
+        self._graph_last_tick = 0.0
+        self._graph_animated_version = -1
+        self._graph_animated = False
+        self._graph_blocks_version = -1
+        self._graph_blocks_cache = None
+        self._folds_version = -1
+        self._folds_cache = None
         self.graph_slider = 0
         self.graph_zones = []
         self.graph_drag_start = None
@@ -419,6 +427,20 @@ class ScratchpadPanel:
                     # Cache peer notes on disk, outside the private store.
                     self._save_shared()
                     changed = True
+        if self.text_version != self._graph_animated_version:
+            self._graph_animated_version = self.text_version
+            animated = False
+            for block in self.graph_blocks():
+                source = block[4]
+                if 'time' in source or 'dt' in source:
+                    animated = True
+                    break
+            self._graph_animated = animated
+        if self.graph_focus is not None or self._graph_animated:
+            now = time.monotonic()
+            if now - self._graph_last_tick >= 1 / 60:
+                self._graph_last_tick = now
+                changed = True
         return changed
 
     def start_capture(self, start, end, command):
@@ -480,6 +502,8 @@ class ScratchpadPanel:
                 self.title = None
         self.text = self.text[:start] + value + self.text[end:]
         self.text_version += 1
+        self._graph_blocks_version = -1
+        self._folds_version = -1
         self.paste_blocks = [b for b in self.paste_blocks if b['start'] < b['end']
                              and b['start'] <= len(self.text) and b['end'] <= len(self.text)
                              and (b['start'] == 0 or self.text[b['start'] - 1] == '\n')
@@ -508,6 +532,8 @@ class ScratchpadPanel:
                 deepcopy(self.paste_blocks), self.collapsed_sections.copy(), deepcopy(self.inspector.blocks))
 
     def folds(self):
+        if self._folds_cache is not None and self._folds_version == self.text_version:
+            return self._folds_cache
         # Older ranges could absorb edits after a pasted JSON fence. Recover
         # their actual boundary before excluding headings from section parsing.
         for block in self.paste_blocks:
@@ -525,7 +551,15 @@ class ScratchpadPanel:
             preview = self.text[block['start']:block['end']].splitlines()
             result.append(dict(block, body=block['start'], kind='paste',
                                label='Paste: ' + (preview[0][:60] if preview else '')))
-        return sorted(result, key=lambda b: (b['start'], -b['end']))
+        # Graph fences are collapsible sections too.
+        for start, _offset, end, _key, source in self.graph_blocks():
+            first = source.splitlines()[0] if source else ''
+            result.append(dict(start=start, body=start, end=end, kind='graph',
+                               collapsed=start in self.collapsed_sections,
+                               label='Graph: ' + (first[:60] if first else '')))
+        self._folds_version = self.text_version
+        self._folds_cache = sorted(result, key=lambda b: (b['start'], -b['end']))
+        return self._folds_cache
 
     def reveal(self, start, end=None, before=False):
         end = start if end is None else end
@@ -534,11 +568,13 @@ class ScratchpadPanel:
             if before and start == block['start']:
                 continue
             if block['collapsed'] and start < block['end'] and end >= block['body']:
-                if block['kind'] == 'section':
+                if block['kind'] in ('section', 'graph'):
                     self.collapsed_sections.discard(block['start'])
                 else:
                     next(b for b in self.paste_blocks if b['start'] == block['start'])['collapsed'] = False
                 changed = True
+        if changed:
+            self._folds_version = -1
         return changed
 
     def toggle_fold(self, position=None):
@@ -548,7 +584,7 @@ class ScratchpadPanel:
         if not candidates:
             return
         block = min(candidates, key=lambda b: b['end'] - b['start'])
-        if block['kind'] == 'section':
+        if block['kind'] in ('section', 'graph'):
             if block['collapsed']:
                 self.collapsed_sections.discard(block['start'])
             else:
@@ -559,6 +595,7 @@ class ScratchpadPanel:
         self.selection = self.anchor = None
         self.follow = True
         self.save_position()
+        self._folds_version = -1
 
     def _resolve_dropped_path(self, value):
         value = value.strip()
@@ -944,6 +981,8 @@ class ScratchpadPanel:
 
     def graph_blocks(self):
         """Only closed graph fences outside other code blocks are executable."""
+        if self._graph_blocks_cache is not None and self._graph_blocks_version == self.text_version:
+            return self._graph_blocks_cache
         blocks, offset, fence, start = [], 0, None, 0
         for line in self.text.splitlines(keepends=True):
             marker = re.fullmatch(r' {0,3}(`{3,}|~{3,})([^\n]*)\n?', line)
@@ -958,6 +997,8 @@ class ScratchpadPanel:
                         blocks.append((start, offset, offset + len(line.rstrip('\n')), key, source))
                     fence = None
             offset += len(line)
+        self._graph_blocks_version = self.text_version
+        self._graph_blocks_cache = blocks
         return blocks
 
     def graph(self, key, source):
@@ -993,6 +1034,7 @@ class ScratchpadPanel:
         controls = graph.sliders(index)
         if event == 'escape' or event == 'key' and value in ('\x03', 'e', '\r'):
             self.graph_focus = None
+            self._graph_last_tick = 0.0
             if event == 'key' and value == 'e':
                 block = next((b for b in self.graph_blocks() if b[3] == key), None)
                 if block:
@@ -1410,6 +1452,7 @@ class ScratchpadPanel:
         if self.graph_focus is not None:
             if event == 'find' or event == 'key' and value == '\x06':
                 self.graph_focus = None
+                self._graph_last_tick = 0.0
                 self.event(event, value)
                 return
             self.graph_event(event, value)
@@ -1917,6 +1960,14 @@ class ScratchpadPanel:
                     add_row(MUTED + wrap(safe_summary, width)[0] if summary_visible else '', position, position, [], [])
                     if position <= self.cursor < covering['end']:
                         cursor_row, cursor_col = len(physical) - 1, 0
+                elif covering['kind'] == 'graph' and position == covering['start']:
+                    fold_rows[len(physical)] = covering
+                    summary = covering['label'] + ' … (collapsed)'
+                    safe_summary, _ = self._visible(summary, 0)
+                    summary_visible = viewport_start <= len(physical) < viewport_start + viewport_height
+                    add_row(MUTED + wrap(safe_summary, width)[0] if summary_visible else '', position, position, [], [])
+                    if position <= self.cursor < covering['end']:
+                        cursor_row, cursor_col = len(physical) - 1, 0
                 position = end + 1
                 continue
             if block:
@@ -2102,6 +2153,8 @@ class ScratchpadPanel:
                 put(row, max(1, origin - 2), '▸' if fold['collapsed'] else '▾', 1, ACCENT)
                 self.zones.append((row, max(1, origin - 2), max(1, origin - 2), 'fold', fold['start']))
                 if fold['kind'] == 'paste' and fold['collapsed']:
+                    self.zones.append((row, origin, cols, 'fold', fold['start']))
+                elif fold['kind'] == 'graph' and fold['collapsed']:
                     self.zones.append((row, origin, cols, 'fold', fold['start']))
             self.hit_rows[row] = (left, right, [(a + origin, b + origin, c, d) for a, b, c, d in spans])
             target = graph_rows.get(self.offset + index)

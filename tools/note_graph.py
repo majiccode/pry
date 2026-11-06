@@ -39,16 +39,23 @@ from dataclasses import dataclass
 import math
 import operator
 import re
+import time
 
 from tui_theme import ACCENT, BASE, BORDER, MUTED, SECONDARY, SUCCESS, WARNING
 
 
 EXAMPLE_SOURCE = """x_axis=[-2..2]
-y_axis=[-2..2]
+y_axis=[-3..11]
 a=[-1..1]
 a=1
 y=sin(x*tau)*a
 plot(y)
+
+# time is elapsed seconds since the graph opened (smooth: sin(time) sweeps 0..2pi over ~6.3s)
+# dt is delta-seconds since the last frame (~0.016s at 60fps; use for decay like a = a * (1 - dt))
+v=5+5*sin(time)
+plot(v)
+
 t=[0..1]
 plotxy(cos(t*tau),sin(t*tau))
 r=[0..2]
@@ -255,6 +262,8 @@ class Graph:
             raise _error(257, 'source exceeds 256 lines')
         self.ranges = {}
         self.values = {}
+        self._start = time.monotonic()
+        self._last_render = self._start
         self.axis_ranges = {}
         self.axis_views = {}
         self.axis_controls = {}
@@ -279,7 +288,7 @@ class Graph:
                 if not match:
                     raise _error(line, 'expected name=expression, name=[lo..hi], or plot(...)')
                 name, text = match.groups()
-                if name in _CONSTANTS or name in _FUNCTIONS or name in ('plot', 'plotxy'):
+                if name in _CONSTANTS or name in _FUNCTIONS or name in ('plot', 'plotxy', 'time', 'dt'):
                     raise _error(line, f'reserved name {name}')
                 assignments += 1
                 if assignments > 96:
@@ -316,6 +325,7 @@ class Graph:
                         if len(variants) >= 24:
                             raise _error(line, 'at most 24 curves per name are allowed')
                         variants.append(expression)
+        self.values['time'] = 0.0
         # Also validate unused formulas, rather than silently accepting typos.
         self._validate(definitions)
         if not self.plots:
@@ -556,7 +566,7 @@ class Graph:
         def visit(name, line, depth, index=None):
             if name in self.ranges:
                 return 0
-            if name in ('x', 'y') and index is None:
+            if name in ('x', 'y', 'time', 'dt'):
                 return 0
             if name not in definitions:
                 raise _error(line, f'unknown name {name}')
@@ -886,6 +896,12 @@ class Graph:
         width, height = max(0, min(240, width)), max(0, min(64, height))
         if not width or not height:
             return []
+
+        now = time.monotonic()
+        dt = max(0.0, min(0.25, now - self._last_render))
+        self._last_render = now
+        self.values['time'] = max(0.0, now - self._start)
+        self.values['dt'] = dt
 
         def styled(text, color=MUTED):
             return color + text[:width] + BASE
