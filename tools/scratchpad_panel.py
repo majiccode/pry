@@ -685,8 +685,13 @@ class ScratchpadPanel:
                             user_id=self.user_id, user_name=self.user_name,
                             file_name=path.name, mime=mime, is_image=is_image,
                             is_directory=is_directory)
+        actions = []
+        if not is_directory:
+            actions.append(dict(label='Download file',
+                                target=dict(kind='file_download', path=str(dest))))
         page = dict(title=f'{path.name} · file source',
-                    entries=[dict(label='Open file', target=entry_target)])
+                    entries=[dict(label='Open file', target=entry_target)],
+                    actions=actions)
         self.inspector.add(begin, begin + len(meta), f'file: {dest}', '',
                            str(dest), 0, owner_user_id=self.user_id, block_type='file_source',
                            page=page)
