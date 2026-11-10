@@ -28,8 +28,9 @@ handles appear as sliders alongside the parameter sliders.
 
 render(width, height) returns at most height rows of at most width visible
 columns, capped at 240 columns and 64 rows. Height includes the title/legend,
-axis labels, and readout, not slider controls. Quadrant and half-block
-characters provide a 2-by-2 subcell drawing grid. ANSI SGR sequences do not
+axis labels, and readout, not slider controls. Quadrant/half-block characters
+provide a 2-by-2 subcell grid; sextants provide 2-by-3. render_image() returns
+palette pixels for Kitty, iTerm2, and Sixel renderers. ANSI SGR sequences do not
 count toward the width. Small viewports gracefully omit drawing rows.
 """
 
@@ -41,7 +42,7 @@ import operator
 import re
 import time
 
-from tui_theme import ACCENT, BASE, BORDER, MUTED, SECONDARY, SUCCESS, WARNING
+from tui_theme import ACCENT, BACKGROUND, BASE, BORDER, MUTED, SECONDARY, SUCCESS, WARNING
 
 
 EXAMPLE_SOURCE = """x_axis=[-2..2]
@@ -84,8 +85,19 @@ _PALETTE = (SECONDARY, SUCCESS, WARNING, '\033[38;5;213m',
             '\033[38;5;141m')
 _PAN_SENSITIVITY = 0.3
 _NAME = r'[A-Za-z_][A-Za-z_0-9]{0,31}'
-_BLOCKS = (' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛',
-           '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█')
+_QUADRANTS = (' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛',
+              '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█')
+_SEXTANTS = (
+    ' ', '🬀', '🬁', '🬂', '🬃', '🬄', '🬅', '🬆',
+    '🬇', '🬈', '🬉', '🬊', '🬋', '🬌', '🬍', '🬎',
+    '🬏', '🬐', '🬑', '🬒', '🬓', '▌', '🬔', '🬕',
+    '🬖', '🬗', '🬘', '🬙', '🬚', '🬛', '🬜', '🬝',
+    '🬞', '🬟', '🬠', '🬡', '🬢', '🬣', '🬤', '🬥',
+    '🬦', '🬧', '▐', '🬨', '🬩', '🬪', '🬫', '🬬',
+    '🬭', '🬮', '🬯', '🬰', '🬱', '🬲', '🬳', '🬴',
+    '🬵', '🬶', '🬷', '🬸', '🬹', '🬺', '🬻', '█',
+)
+_GLYPHS = {'quadrant': (2, 2, _QUADRANTS), 'sextant': (2, 3, _SEXTANTS)}
 _AXIS_DECLARATIONS = {'axisx': 'x', 'axisy': 'y', 'x_axis': 'x', 'y_axis': 'y',
                       'xrange': 'x', 'yrange': 'y'}
 _AXIS_CONTROL_SUFFIX = {'.min': 0, '.max': 1}
@@ -145,6 +157,50 @@ class _Plot:
     controls: tuple = ()
     old: bool = False
     sweep_axis: str = 'x'
+
+
+@dataclass(frozen=True)
+class Raster:
+    """Palette-indexed pixels for a graphics-protocol renderer."""
+    width: int
+    height: int
+    pixels: bytes
+    palette: tuple
+
+
+@dataclass
+class GraphImage:
+    """Text rows around a raster plus the raster's cell-relative placement."""
+    rows: list
+    raster: Raster
+    row: int
+    col: int
+    width: int
+    height: int
+
+
+@dataclass
+class _Scene:
+    plot: _Plot
+    height: int
+    drawing_height: int
+    margin: int
+    cols: int
+    nx: int
+    ny: int
+    sampled: list
+    xs: list
+    x_bounds: tuple
+    y_bounds: tuple
+    empty: bool
+    exhausted: bool
+    xspan: float
+    yspan: float
+    title: str
+    x_label: str
+    readout: str
+    hover: tuple
+    hover_readout: str
 
 
 def _split_args(text):
@@ -235,6 +291,77 @@ def _constant(expression):
         return _evaluate(expression.node, lambda name: 0.0, [4096])
     except (ArithmeticError, ValueError, _BudgetExceeded) as exc:
         raise _error(expression.line, 'invalid constant expression') from exc
+
+
+class _CellCanvas:
+    def __init__(self, cols, rows, sx, sy, glyphs):
+        self.cols = cols
+        self.rows = rows
+        self.sx = sx
+        self.sy = sy
+        self.glyphs = glyphs
+        self.bits = [[0] * cols for _ in range(rows)]
+        self.colors = [[BORDER] * cols for _ in range(rows)]
+
+    def dot(self, x, y, color):
+        if 0 <= x < self.cols * self.sx and 0 <= y < self.rows * self.sy:
+            row, col = y // self.sy, x // self.sx
+            bit = (y % self.sy) * self.sx + (x % self.sx)
+            self.bits[row][col] |= 1 << bit
+            self.colors[row][col] = color
+
+    def line(self, x0, y0, x1, y1, color):
+        dx, sx = abs(x1 - x0), 1 if x0 < x1 else -1
+        dy, sy = -abs(y1 - y0), 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            self.dot(x0, y0, color)
+            if x0 == x1 and y0 == y1:
+                break
+            doubled = 2 * err
+            if doubled >= dy:
+                err += dy
+                x0 += sx
+            if doubled <= dx:
+                err += dx
+                y0 += sy
+
+
+class _PixelCanvas:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.pixels = bytearray(width * height)
+        self.palette = [BACKGROUND]
+        self._indices = {BACKGROUND: 0}
+
+    def _index(self, color):
+        index = self._indices.get(color)
+        if index is None:
+            index = len(self.palette)
+            self._indices[color] = index
+            self.palette.append(color)
+        return index
+
+    def dot(self, x, y, color):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            self.pixels[y * self.width + x] = self._index(color)
+
+    def line(self, x0, y0, x1, y1, color):
+        dx, sx = abs(x1 - x0), 1 if x0 < x1 else -1
+        dy, sy = -abs(y1 - y0), 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            self.dot(x0, y0, color)
+            if x0 == x1 and y0 == y1:
+                break
+            doubled = 2 * err
+            if doubled >= dy:
+                err += dy
+                x0 += sx
+            if doubled <= dx:
+                err += dx
+                y0 += sy
 
 
 class Graph:
@@ -858,10 +985,11 @@ class Graph:
             points.append(point)
         return points, (lo, hi)
 
-    def _implicit_points(self, plot, curve, bounds, nx, ny, budget):
+    def _implicit_points(self, plot, curve, bounds, nx, ny, budget,
+                         max_columns=120, max_rows=90):
         xlo, xhi, ylo, yhi = bounds
-        columns = max(2, min(120, nx))
-        rows = max(2, min(90, ny))
+        columns = max(2, min(max_columns, nx))
+        rows = max(2, min(max_rows, ny))
         grid = []
         for j in range(rows + 1):
             y = yhi - (yhi - ylo) * j / rows
@@ -892,27 +1020,7 @@ class Graph:
                     points.append((x, y))
         return points
 
-    def render(self, width, height, plot_index=0, hover=None):
-        """Draw within the supplied viewport using the current axis views.
-
-        Domain/overflow errors leave gaps. Large adjacent jumps are not joined.
-        An exhausted shared operation budget leaves gaps and a visible notice.
-        No terminal I/O, terminal-size detection, or slider rendering occurs.
-
-        ``hover`` is an optional (px, py) pixel position within the drawing
-        area; when supplied a crosshair is drawn at that point and the
-        corresponding data values are appended to the readout.
-        """
-        plot = self._plot(plot_index)
-        if type(width) is not int or type(height) is not int:
-            raise ValueError('width and height must be integers')
-        width, height = max(0, min(240, width)), max(0, min(64, height))
-        if not width or not height:
-            return []
-
-        def styled(text, color=MUTED):
-            return color + text[:width] + BASE
-
+    def _title(self, plot, width):
         labels = [curve.label for curve in plot.curves]
         legend = (f'{plot.output} vs {plot.sweep} | ' if plot.old
                   else ' | '.join(labels))
@@ -923,15 +1031,30 @@ class Graph:
                 extra = f'{label}(L{plot.curves[index].line}) '
                 title += _PALETTE[index % len(_PALETTE)] + extra[:max(0, width - used)]
                 used = min(width, used + len(extra))
-        rows = [title + BASE]
-        if height == 1:
-            return rows
-        budget = [200000]
-        exhausted = False
+        return title + BASE
+
+    def _scene(self, width, height, plot_index, hover, sub_x=2, sub_y=2, pixel_size=None):
+        plot = self._plot(plot_index)
+        title = self._title(plot, width)
         drawing_height = max(0, height - 3)
         margin = 10 if width >= 24 else 0
         cols = width - margin
-        nx, ny = max(2, cols * 2), max(2, drawing_height * 2)
+        if height == 1:
+            return _Scene(plot=plot, height=height, drawing_height=0, margin=0,
+                          cols=width, nx=2, ny=2, sampled=[], xs=[],
+                          x_bounds=(-1.0, 1.0), y_bounds=(-1.0, 1.0),
+                          empty=True, exhausted=False, xspan=0, yspan=0,
+                          title=title, x_label='', readout='', hover=None,
+                          hover_readout='')
+        budget = [200000]
+        exhausted = False
+        if pixel_size is None:
+            nx, ny = max(2, cols * sub_x), max(2, drawing_height * sub_y)
+            implicit_columns, implicit_rows = 120, 90
+        else:
+            nx = max(2, min(2000, int(pixel_size[0])))
+            ny = max(2, min(2000, int(pixel_size[1])))
+            implicit_columns, implicit_rows = min(240, nx), min(180, ny)
         sampled = []
         xs, ys = [], []
         if drawing_height:
@@ -979,99 +1102,27 @@ class Graph:
                 if curve.kind != 'implicit':
                     continue
                 try:
-                    points = self._implicit_points(plot, curve, (xlo, xhi, ylo, yhi),
-                                                   nx, ny, budget)
+                    points = self._implicit_points(
+                        plot, curve, (xlo, xhi, ylo, yhi), nx, ny, budget,
+                        max_columns=implicit_columns, max_rows=implicit_rows)
                 except _BudgetExceeded:
                     exhausted = True
                     points = []
                 sampled.append((curve, points, True))
         xspan, yspan = xhi - xlo, yhi - ylo
-        bits = [[0] * cols for _ in range(drawing_height)]
-        colors = [[BORDER] * cols for _ in range(drawing_height)]
-
-        def dot(x, y, color):
-            if 0 <= x < nx and 0 <= y < drawing_height * 2:
-                row, col = y // 2, x // 2
-                bits[row][col] |= 1 << ((y % 2) * 2 + (x % 2))
-                colors[row][col] = color
-
-        def pixel_x(value):
-            return round((value - xlo) / xspan * (nx - 1)) if xspan else 0
-
-        def pixel_y(value):
-            return round((yhi - value) / yspan * (ny - 1)) if yspan else 0
-
-        if drawing_height and not empty:
-            if ylo <= 0 <= yhi:
-                y = pixel_y(0)
-                for x in range(nx):
-                    dot(x, y, BORDER)
-            if xlo <= 0 <= xhi:
-                x = pixel_x(0)
-                for y in range(ny):
-                    dot(x, y, BORDER)
-            if plot.sweep and plot.sweep in self.values:
-                playhead = self.values[plot.sweep]
-                if plot.sweep_axis == 'y' and ylo <= playhead <= yhi:
-                    y = pixel_y(playhead)
-                    for x in range(0, nx, 4):
-                        dot(x, y, MUTED)
-                elif xlo <= playhead <= xhi:
-                    x = pixel_x(playhead)
-                    for y in range(0, ny, 2):
-                        dot(x, y, MUTED)
-            for index, (curve, points, discrete) in enumerate(sampled):
-                color = _PALETTE[index % len(_PALETTE)]
-                previous = None
-                for point in points:
-                    if point is None:
-                        previous = None
-                        continue
-                    x, y = point
-                    if not (math.isfinite(x) and math.isfinite(y)):
-                        previous = None
-                        continue
-                    if not (xlo <= x <= xhi and ylo <= y <= yhi):
-                        previous = None
-                        continue
-                    px, py = pixel_x(x), pixel_y(y)
-                    dot(px, py, color)
-                    if not discrete and previous is not None:
-                        if abs(py - previous) <= max(2, ny // 2):
-                            distance = abs(py - previous)
-                            for step in range(1, distance):
-                                dot(px, previous + (1 if py > previous else -1) * step, color)
-                    previous = py if not discrete else None
         hover_readout = ''
         if hover is not None and drawing_height and not empty:
             hx, hy = hover
-            if 0 <= hx < nx and 0 <= hy < drawing_height * 2:
-                for py in range(drawing_height * 2):
-                    dot(hx, py, ACCENT)
-                for px in range(nx):
-                    dot(px, hy, ACCENT)
+            if 0 <= hx < nx and 0 <= hy < ny:
                 x_data = xlo + hx / (nx - 1) * xspan if xspan else xlo
                 y_data = yhi - hy / (ny - 1) * yspan if yspan else ylo
                 hover_readout = f' x={x_data:.4g} y={y_data:.4g}'
-        for row in range(drawing_height):
-            prefix = ''
-            if margin:
-                label = f'{yhi:.3g}' if row == 0 else f'{ylo:.3g}' if row == drawing_height - 1 else ''
-                prefix = MUTED + label[:margin - 1].rjust(margin - 1) + ' '
-            rendered = prefix
-            last_color = None
-            for col in range(cols):
-                color = colors[row][col]
-                if color != last_color:
-                    rendered += color
-                    last_color = color
-                rendered += _BLOCKS[bits[row][col]]
-            rows.append(rendered + BASE)
+        x_label = ''
         if height >= 3:
             left = f'{xlo:.4g}' if not empty else 'axes outside range'
             right = f'{xhi:.4g} {plot.sweep if plot.old else "x"}' if not empty else ''
             label = left + ' ' * max(1, cols - len(left) - len(right)) + right
-            rows.append(styled(' ' * margin + label))
+            x_label = MUTED + (' ' * margin + label)[:width] + BASE
         if plot.old:
             readout = f'{plot.sweep}={self.values[plot.sweep]:.4g}'
             for curve in plot.curves:
@@ -1098,5 +1149,163 @@ class Graph:
         elif drawing_height and not xs and not any(c.kind == 'implicit' for c in plot.curves):
             readout = 'no finite samples | ' + readout
         readout += hover_readout
-        rows.append(styled(readout, WARNING if exhausted or empty else ACCENT))
-        return rows[:height]
+        readout = (WARNING if exhausted or empty else ACCENT) + readout[:width] + BASE
+        return _Scene(plot=plot, height=height, drawing_height=drawing_height,
+                      margin=margin, cols=cols, nx=nx, ny=ny, sampled=sampled,
+                      xs=xs, x_bounds=(xlo, xhi), y_bounds=(ylo, yhi),
+                      empty=empty, exhausted=exhausted, xspan=xspan, yspan=yspan,
+                      title=title, x_label=x_label, readout=readout,
+                      hover=hover, hover_readout=hover_readout)
+
+    def _draw(self, scene, canvas):
+        if not scene.drawing_height or scene.empty:
+            return
+        plot, nx, ny = scene.plot, scene.nx, scene.ny
+        xlo, xhi = scene.x_bounds
+        ylo, yhi = scene.y_bounds
+
+        def pixel_x(value):
+            return round((value - xlo) / scene.xspan * (nx - 1)) if scene.xspan else 0
+
+        def pixel_y(value):
+            return round((yhi - value) / scene.yspan * (ny - 1)) if scene.yspan else 0
+
+        if ylo <= 0 <= yhi:
+            canvas.line(0, pixel_y(0), nx - 1, pixel_y(0), BORDER)
+        if xlo <= 0 <= xhi:
+            canvas.line(pixel_x(0), 0, pixel_x(0), ny - 1, BORDER)
+        if plot.sweep and plot.sweep in self.values:
+            playhead = self.values[plot.sweep]
+            if plot.sweep_axis == 'y' and ylo <= playhead <= yhi:
+                y = pixel_y(playhead)
+                xstep = max(1, nx // max(1, scene.cols * 2)) * 4
+                for x in range(0, nx, xstep):
+                    canvas.dot(x, y, MUTED)
+            elif xlo <= playhead <= xhi:
+                x = pixel_x(playhead)
+                ystep = max(1, ny // max(1, scene.drawing_height * 2)) * 2
+                for y in range(0, ny, ystep):
+                    canvas.dot(x, y, MUTED)
+        for index, (curve, points, discrete) in enumerate(scene.sampled):
+            color = _PALETTE[index % len(_PALETTE)]
+            previous = None
+            for point in points:
+                if point is None:
+                    previous = None
+                    continue
+                x, y = point
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    previous = None
+                    continue
+                if not (xlo <= x <= xhi and ylo <= y <= yhi):
+                    previous = None
+                    continue
+                px, py = pixel_x(x), pixel_y(y)
+                canvas.dot(px, py, color)
+                if not discrete and previous is not None:
+                    if abs(py - previous[1]) <= max(2, ny // 2):
+                        canvas.line(previous[0], previous[1], px, py, color)
+                previous = None if discrete else (px, py)
+        if scene.hover is not None:
+            hx, hy = scene.hover
+            if 0 <= hx < nx and 0 <= hy < ny:
+                canvas.line(hx, 0, hx, ny - 1, ACCENT)
+                canvas.line(0, hy, nx - 1, hy, ACCENT)
+
+    def _text_rows(self, scene, canvas):
+        rows = [scene.title]
+        for row in range(scene.drawing_height):
+            prefix = ''
+            if scene.margin:
+                label = (f'{scene.y_bounds[1]:.3g}' if row == 0
+                         else f'{scene.y_bounds[0]:.3g}' if row == scene.drawing_height - 1 else '')
+                prefix = MUTED + label[:scene.margin - 1].rjust(scene.margin - 1) + ' '
+            rendered = prefix
+            last_color = None
+            for col in range(scene.cols):
+                color = canvas.colors[row][col]
+                if color != last_color:
+                    rendered += color
+                    last_color = color
+                rendered += canvas.glyphs[canvas.bits[row][col]]
+            rows.append(rendered + BASE)
+        if scene.height >= 3:
+            rows.append(scene.x_label)
+        rows.append(scene.readout)
+        return rows[:scene.height]
+
+    def _image_rows(self, scene):
+        rows = [scene.title]
+        for row in range(scene.drawing_height):
+            prefix = ''
+            if scene.margin:
+                label = (f'{scene.y_bounds[1]:.3g}' if row == 0
+                         else f'{scene.y_bounds[0]:.3g}' if row == scene.drawing_height - 1 else '')
+                prefix = MUTED + label[:scene.margin - 1].rjust(scene.margin - 1) + ' '
+            rows.append(prefix + ' ' * scene.cols + BASE)
+        if scene.height >= 3:
+            rows.append(scene.x_label)
+        rows.append(scene.readout)
+        return rows[:scene.height]
+
+    def render(self, width, height, plot_index=0, hover=None, scheme='quadrant'):
+        """Draw within the supplied viewport using the current axis views.
+
+        Domain/overflow errors leave gaps. Large adjacent jumps are not joined.
+        An exhausted shared operation budget leaves gaps and a visible notice.
+        No terminal I/O, terminal-size detection, or slider rendering occurs.
+
+        ``hover`` is an optional (px, py) pixel position within the drawing
+        area; when supplied a crosshair is drawn at that point and the
+        corresponding data values are appended to the readout. ``scheme`` is
+        ``quadrant`` (2x2) or ``sextant`` (2x3).
+        """
+        plot = self._plot(plot_index)
+        if type(width) is not int or type(height) is not int:
+            raise ValueError('width and height must be integers')
+        width, height = max(0, min(240, width)), max(0, min(64, height))
+        if not width or not height:
+            return []
+        if scheme not in _GLYPHS:
+            scheme = 'quadrant'
+        sx, sy, glyphs = _GLYPHS[scheme]
+        scene = self._scene(width, height, plot_index, hover, sub_x=sx, sub_y=sy)
+        if height == 1:
+            return [scene.title]
+        canvas = _CellCanvas(scene.cols, scene.drawing_height, sx, sy, glyphs)
+        self._draw(scene, canvas)
+        return self._text_rows(scene, canvas)
+
+    def render_image(self, width, height, plot_index=0, hover=None,
+                     pixel_width=None, pixel_height=None):
+        """Return text rows and a palette raster for a graphics protocol.
+
+        The raster covers ``image.width`` terminal columns and ``image.height``
+        rows starting at ``image.row``/``image.col`` relative to the returned
+        rows. ``hover`` uses raster pixel coordinates.
+        """
+        plot = self._plot(plot_index)
+        if type(width) is not int or type(height) is not int:
+            raise ValueError('width and height must be integers')
+        width, height = max(0, min(240, width)), max(0, min(64, height))
+        if not width or height < 2:
+            return None
+        margin = 10 if width >= 24 else 0
+        cols = width - margin
+        drawing_height = max(0, height - 3)
+        if drawing_height <= 0 or cols <= 0:
+            return None
+        if pixel_width is None:
+            pixel_width = cols * 4
+        if pixel_height is None:
+            pixel_height = drawing_height * 8
+        pixel_width = max(1, min(2000, int(pixel_width)))
+        pixel_height = max(1, min(2000, int(pixel_height)))
+        scene = self._scene(width, height, plot_index, hover,
+                            pixel_size=(pixel_width, pixel_height))
+        canvas = _PixelCanvas(pixel_width, pixel_height)
+        self._draw(scene, canvas)
+        raster = Raster(pixel_width, pixel_height, bytes(canvas.pixels),
+                        tuple(canvas.palette))
+        return GraphImage(rows=self._image_rows(scene), raster=raster, row=1,
+                          col=margin, width=cols, height=drawing_height)

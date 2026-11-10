@@ -415,9 +415,15 @@ Arithmetic supports `+ - * / % **` and `^` for powers, parentheses, `pi`, `e`,
 `min`, and `max`. Statements can be on separate lines or separated by semicolons;
 `#` starts a comment. Invalid expressions show a line-specific error. Domain
 errors produce gaps. Evaluation is bounded and does not execute Python code.
-Quadrant and half-block characters provide 2-by-2 drawing cells per terminal
-character; use a Unicode-capable fixed-width font. No graphics protocol or
-third-party dependency is needed.
+Graphs render through Kitty, iTerm2, or Sixel graphics when the terminal
+supports one, using true pixels and per-curve colors. Terminals without a
+supported graphics protocol fall back to Unicode blocks: 2-by-3 sextants where
+available, otherwise 2-by-2 quadrants and half blocks. Sixel uses native pixel
+resolution and falls back to blocks when a graph would be too large to encode
+smoothly. Use a Unicode-capable fixed-width font for the text fallback. No
+third-party dependency is required.
+Override autodetection with `PRY_GRAPH_RENDERER=kitty|iterm2|sixel|sextant|quadrant`;
+`PRY_GRAPH_TEXT=sextant|quadrant` controls the text fallback.
 
 Use **Ctrl+B** or `/sidebar` to toggle the saved
 session sidebar. The preference persists across launches, and toggling preserves

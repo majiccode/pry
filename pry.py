@@ -52,6 +52,7 @@ from storage_panel import StoragePanel
 from watches import WatchEngine
 from watches_panel import WatchesPanel
 from scratchpad_panel import ScratchpadPanel
+import note_graph_graphics
 from network_notes import NetworkNotes
 from spotlight_search import SpotlightSearch
 from terminal_zoom import TerminalZoom
@@ -1722,6 +1723,16 @@ def read_input_event(fd):
         return ('escape', None)
     if prefix in (b'\r', b'\n'):
         return ('newline', None)
+    if prefix == b'_':
+        sequence = bytearray()
+        while not sequence.endswith(b'\x1b\\'):
+            byte = next_byte()
+            if not byte:
+                return ('ignore', None)
+            sequence.extend(byte)
+            if len(sequence) > 65536:
+                return ('ignore', None)
+        return ('graphics_reply', sequence[:-2].decode('ascii', 'replace'))
     if prefix not in (b'[', b'O'):
         return ('ignore', None)
     sequence = b''
@@ -1758,6 +1769,8 @@ def read_input_event(fd):
     if sequence in keys:
         return keys[sequence]
     if prefix == b'[':
+        if re.fullmatch(rb'\?[0-9;]*c', sequence):
+            return ('graphics_reply', sequence.decode('ascii', 'replace'))
         cell = re.fullmatch(rb'6;(\d+);(\d+)t', sequence)
         if cell:
             return ('cell_size', (int(cell[1]), int(cell[2])))
@@ -3044,7 +3057,10 @@ def redraw_screen():
         if about_open:
             draw_about_modal()
     frame = output.getvalue()
-    sys.stdout.write('\033[?2026h' + frame + ('' if main_search.active or about_open else hover_overlay(frame)) + '\033[?2026l')
+    sys.stdout.write(note_graph_graphics.delete_sequence()
+                     + '\033[?2026h' + frame
+                     + ('' if main_search.active or about_open else hover_overlay(frame))
+                     + '\033[?2026l')
     sys.stdout.flush()
 
 
@@ -3111,11 +3127,15 @@ def hover_overlay(frame):
     target_row, left, right = region
     row, col = 1, 1
     cells = {}
-    for token in re.split(r'(\x1b\[[0-?]*[ -/]*[@-~])', frame):
+    for token in re.split(
+            r'(\x1b\[[0-?]*[ -/]*[@-~]|\x1b[78]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
+            r'|\x1b_.*?\x1b\\|\x1bP.*?\x1b\\)', frame, flags=re.S):
         if token.startswith('\x1b['):
             match = re.fullmatch(r'\x1b\[(\d*);?(\d*)[Hf]', token)
             if match:
                 row, col = int(match[1] or 1), int(match[2] or 1)
+            continue
+        if token.startswith('\x1b'):
             continue
         for unit, start, end in text_cells(token):
             if row == target_row:
@@ -3774,6 +3794,10 @@ def main():
         sys.stdout.write(MOUSE_ON)
         sys.stdout.flush()
         redraw_screen()
+        probe = note_graph_graphics.probe_sequence()
+        if probe:
+            sys.stdout.write(probe)
+            sys.stdout.flush()
         last_size = None
         about_mouse_release = False
         while True:
@@ -3811,6 +3835,10 @@ def main():
                 continue
                 
             event, value = read_input_event(fd)
+            if event == 'graphics_reply':
+                if note_graph_graphics.observe_probe(value):
+                    redraw_screen()
+                continue
             if event == 'key' and value == '\x03':
                 if isinstance(git_panel, ScratchpadPanel):
                     # Ctrl+C / Cmd+C in notes is copy, never exit
@@ -3824,6 +3852,7 @@ def main():
             if event == 'eof':
                 break
             if event == 'cell_size':
+                note_graph_graphics.observe_cell(*value)
                 if terminal_zoom.observe_cell(*value):
                     redraw_screen()
                 continue

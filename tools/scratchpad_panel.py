@@ -23,7 +23,8 @@ import webbrowser
 from response_rendering import render_markdown, INLINE
 from spotlight_search import SpotlightSearch
 from pry_state import load_state, save_state
-from note_graph import Graph, EXAMPLE_SOURCE
+from note_graph import Graph, GraphImage, EXAMPLE_SOURCE
+import note_graph_graphics
 from note_folding import sections, prepare_paste, highlight_json
 from command_runner import CommandJob
 from network_notes import DEFAULT_PEER_HOST, DEFAULT_PEER_PORT
@@ -435,7 +436,11 @@ class ScratchpadPanel:
             # Pause animation while the user is actively scrolling, typing, or clicking.
             # Resume once they've been idle for GRAPH_IDLE_THRESHOLD seconds.
             if now - self._last_activity >= GRAPH_IDLE_THRESHOLD:
-                if now - self._graph_last_tick >= 1 / 60:
+                if note_graph_graphics.is_graphics():
+                    interval = 1 / 12 if note_graph_graphics.backend() == 'sixel' else 1 / 30
+                else:
+                    interval = 1 / 60
+                if now - self._graph_last_tick >= interval:
                     self._graph_last_tick = now
                     # Advance the built-in time/dt on every graph so the next
                     # render draws a new frame. render() itself no longer
@@ -1029,12 +1034,21 @@ class ScratchpadPanel:
         else:
             self.message = 'Graph: ' + graph
 
-    def graph_preview(self, key, graph, width, index):
-        cache_key = (key, width, index, tuple(graph.values.items()))
+    def graph_preview(self, key, graph, width, index, image=None):
+        scheme = 'image' if image is not None else note_graph_graphics.text_scheme()
+        cache_key = (key, width, index, tuple(graph.values.items()), scheme, image)
         if cache_key not in self.graph_render_cache:
             if len(self.graph_render_cache) >= 64:
                 self.graph_render_cache.pop(next(iter(self.graph_render_cache)))
-            self.graph_render_cache[cache_key] = graph.render(width, 10, index)
+            if image is not None:
+                try:
+                    self.graph_render_cache[cache_key] = graph.render_image(
+                        width, 10, index, pixel_width=image[0], pixel_height=image[1])
+                except Exception:
+                    self.graph_render_cache[cache_key] = None
+            else:
+                self.graph_render_cache[cache_key] = graph.render(
+                    width, 10, index, scheme=scheme)
         return self.graph_render_cache[cache_key]
 
     def graph_event(self, event, value):
@@ -1187,15 +1201,45 @@ class ScratchpadPanel:
         graph_height = max(0, room - slider_rows)
         margin = 10 if cols >= 24 else 0
         self.graph_draw_rect = (top + 2, top + 1 + graph_height, margin + 1, cols)
-        hover = None
-        if self.graph_hover is not None:
-            hx, hy = self.graph_hover
-            if margin + 1 <= hx <= cols and top + 2 <= hy <= top + 1 + graph_height:
-                px = (hx - (margin + 1)) * 2
-                py = (hy - (top + 2)) * 2
-                hover = (px, py)
-        for number, line in enumerate(graph.render(cols, graph_height, index, hover=hover)):
+        plot_cols = cols - margin
+        image = None
+        image_output = None
+        if note_graph_graphics.is_graphics() and plot_cols > 0 and graph_height > 3:
+            pixel_width, pixel_height = note_graph_graphics.pixel_size(plot_cols, graph_height - 3)
+            image_hover = None
+            if note_graph_graphics.supports_size(pixel_width, pixel_height):
+                if self.graph_hover is not None:
+                    hx, hy = self.graph_hover
+                    if margin + 1 <= hx <= cols and top + 2 <= hy <= top + 1 + graph_height:
+                        fraction_x = (hx - (margin + 1) + 0.5) / max(1, plot_cols)
+                        fraction_y = (hy - (top + 2) + 0.5) / max(1, graph_height - 3)
+                        image_hover = (round(fraction_x * (pixel_width - 1)),
+                                       round(fraction_y * (pixel_height - 1)))
+                try:
+                    image = graph.render_image(cols, graph_height, index, hover=image_hover,
+                                               pixel_width=pixel_width, pixel_height=pixel_height)
+                    if image is not None:
+                        image_output = note_graph_graphics.image_sequence(
+                            image.raster, top + 2 + image.row, image.col + 1,
+                            image.width, image.height)
+                except Exception:
+                    image = None
+                    image_output = None
+        if image is not None:
+            lines = image.rows
+        else:
+            scheme = note_graph_graphics.text_scheme()
+            sx, sy = (2, 3) if scheme == 'sextant' else (2, 2)
+            hover = None
+            if self.graph_hover is not None:
+                hx, hy = self.graph_hover
+                if margin + 1 <= hx <= cols and top + 2 <= hy <= top + 1 + graph_height:
+                    hover = ((hx - (margin + 1)) * sx, (hy - (top + 2)) * sy)
+            lines = graph.render(cols, graph_height, index, hover=hover, scheme=scheme)
+        for number, line in enumerate(lines):
             put(top + 2 + number, line)
+        if image_output:
+            output.append(image_output)
         first = max(0, self.graph_slider - slider_rows + 1)
         for number, name in enumerate(controls[first:first + slider_rows], first):
             lo, hi = graph.ranges[name]
@@ -1912,6 +1956,7 @@ class ScratchpadPanel:
         position, fence = 0, None
         blocks = {block[2]: block for block in self.graph_blocks()}
         graph_rows = {}
+        graph_images = []
         inspector_rows = {}
         fold_rows = {}
         folds = self.folds()
@@ -2115,8 +2160,27 @@ class ScratchpadPanel:
                 if isinstance(graph, Graph):
                     for plot_index in range(len(graph.plots)):
                         plot_visible = len(physical) < viewport_start + viewport_height and len(physical) + 10 > viewport_start
-                        preview = self.graph_preview(key, graph, width, plot_index) if plot_visible else [''] * 10
-                        for rendered in preview:
+                        image_size = None
+                        if (plot_visible and not self.search.active
+                                and len(physical) >= viewport_start
+                                and len(physical) + 10 <= viewport_start + viewport_height
+                                and note_graph_graphics.is_graphics()):
+                            preview_margin = 10 if width >= 24 else 0
+                            if width - preview_margin > 0:
+                                size = note_graph_graphics.pixel_size(width - preview_margin, 7)
+                                if note_graph_graphics.supports_size(*size):
+                                    image_size = size
+                        preview = (self.graph_preview(key, graph, width, plot_index, image=image_size)
+                                   if plot_visible else [''] * 10)
+                        start = len(physical)
+                        if isinstance(preview, GraphImage):
+                            graph_images.append((start, preview))
+                            rendered_rows = preview.rows
+                        else:
+                            if preview is None:
+                                preview = self.graph_preview(key, graph, width, plot_index)
+                            rendered_rows = preview
+                        for rendered in rendered_rows:
                             graph_rows[len(physical)] = (key, source, plot_index)
                             add_row(rendered, end, end, [], [])
                         graph_rows[len(physical)] = (key, source, plot_index)
@@ -2184,6 +2248,14 @@ class ScratchpadPanel:
                         self.zones.append((row, a + origin, b + origin, 'link', url))
         message, _ = self._visible(self.message, 0)
         put(rows, 1, ' ' + message, cols, ERROR if self.dirty else MUTED)
+        for start, image in graph_images:
+            if not (start >= self.offset and start + len(image.rows) <= self.offset + self.height):
+                continue
+            row = first_row + start - self.offset + image.row
+            col = origin + image.col
+            if top < row <= rows:
+                output.append(note_graph_graphics.image_sequence(
+                    image.raster, row, col, image.width, image.height))
         if self.search.active:
             overlay = self.search.draw(cols, rows - top, wrap, (BASE, MUTED, TEXT, ACCENT, SEARCH_HIT))
             output.append(re.sub(r'\033\[(\d+);(\d+)H',
