@@ -1502,6 +1502,7 @@ def handle_submission(text):
             elif verb == '/keys':
                 add_local_result(conversation, text, 'Ctrl+P/N: previous/next input | Ctrl+R: retry | Ctrl+C: stop active work, otherwise exit\n'
                                   'Tab: AI / Notes | Shift+Tab: inspector focus | Alt+Enter: newline | PageUp/Down: scroll\n'
+                                 'F1: inspect block, or graph help when the caret is inside a graph block\n'
                                  'Ctrl+K: searchable workspaces | Ctrl+B or /sidebar: toggle sessions\n'
                                   'Command cards: Edit, Run, More (extra actions). Enter completes and runs slash commands.\n'
                                  'Use {{name}} as an unquoted whole-word recipe parameter.\n'

@@ -23,7 +23,7 @@ import webbrowser
 from response_rendering import render_markdown, INLINE
 from spotlight_search import SpotlightSearch
 from pry_state import load_state, save_state
-from note_graph import Graph, GraphImage, EXAMPLE_SOURCE
+from note_graph import Graph, GraphImage, EXAMPLE_SOURCE, GRAPH_HELP
 import note_graph_graphics
 from note_folding import sections, prepare_paste, highlight_json
 from command_runner import CommandJob
@@ -111,6 +111,9 @@ class ScratchpadPanel:
         self.graph_draw_rect = None
         self.graph_reset_zone = None
         self.graph_hover = None
+        self.graph_help = False
+        self.graph_help_offset = 0
+        self.graph_help_rows = 0
         self.paste_blocks = []
         self.inspector = NoteInspector()
         self.collapsed_sections = set()
@@ -425,13 +428,20 @@ class ScratchpadPanel:
         if self.text_version != self._graph_animated_version:
             self._graph_animated_version = self.text_version
             animated = False
-            for block in self.graph_blocks():
-                source = block[4]
-                if 'time' in source or 'dt' in source:
+            for _start, _offset, _end, key, source in self.graph_blocks():
+                graph = self.graph(key, source)
+                if isinstance(graph, Graph) and any(
+                        graph.animated(index) for index in range(len(graph.plots))):
                     animated = True
                     break
             self._graph_animated = animated
-        if self.graph_focus is not None or self._graph_animated:
+        if self.graph_focus is not None:
+            key, source, index = self.graph_focus
+            graph = self.graph(key, source)
+            animate = isinstance(graph, Graph) and graph.animated(index)
+        else:
+            animate = self._graph_animated
+        if animate and not self.graph_help:
             now = time.monotonic()
             # Pause animation while the user is actively scrolling, typing, or clicking.
             # Resume once they've been idle for GRAPH_IDLE_THRESHOLD seconds.
@@ -586,6 +596,24 @@ class ScratchpadPanel:
             self._folds_version = -1
         return changed
 
+    def _after_fold(self, block):
+        position = block['end']
+        if position < len(self.text) and self.text[position] == '\n':
+            position += 1
+        return position
+
+    def _before_fold(self, block):
+        # Start of the line above the opening fence.
+        line = self.text.rfind('\n', 0, block['body'] - 1) + 1
+        return self.text.rfind('\n', 0, line - 1) + 1
+
+    def _skip_collapsed_graphs(self, position, direction):
+        for block in self.folds():
+            if (block['kind'] == 'graph' and block['collapsed']
+                    and block['body'] <= position < block['end']):
+                return self._after_fold(block) if direction > 0 else self._before_fold(block)
+        return position
+
     def toggle_fold(self, position=None):
         position = self.cursor if position is None else position
         candidates = [b for b in self.folds() if b['start'] <= position < b['end']
@@ -593,14 +621,18 @@ class ScratchpadPanel:
         if not candidates:
             return
         block = min(candidates, key=lambda b: b['end'] - b['start'])
+        collapsed = not block['collapsed']
         if block['kind'] in ('section', 'graph'):
             if block['collapsed']:
                 self.collapsed_sections.discard(block['start'])
             else:
                 self.collapsed_sections.add(block['start'])
         else:
-            next(b for b in self.paste_blocks if b['start'] == block['start'])['collapsed'] = not block['collapsed']
-        self.cursor = block['start']
+            next(b for b in self.paste_blocks if b['start'] == block['start'])['collapsed'] = collapsed
+        if block['kind'] == 'graph' and collapsed:
+            self.cursor = self._after_fold(block)
+        else:
+            self.cursor = block['start']
         self.selection = self.anchor = None
         self.follow = True
         self.save_position()
@@ -1036,7 +1068,7 @@ class ScratchpadPanel:
 
     def graph_preview(self, key, graph, width, index, image=None):
         scheme = 'image' if image is not None else note_graph_graphics.text_scheme()
-        cache_key = (key, width, index, tuple(graph.values.items()), scheme, image)
+        cache_key = (key, width, index, graph.cache_values(index), scheme, image)
         if cache_key not in self.graph_render_cache:
             if len(self.graph_render_cache) >= 64:
                 self.graph_render_cache.pop(next(iter(self.graph_render_cache)))
@@ -1050,6 +1082,54 @@ class ScratchpadPanel:
                 self.graph_render_cache[cache_key] = graph.render(
                     width, 10, index, scheme=scheme)
         return self.graph_render_cache[cache_key]
+
+    def toggle_graph_help(self):
+        self.graph_help = not self.graph_help
+        if self.graph_help:
+            self.graph_help_offset = 0
+
+    def graph_help_event(self, event, value):
+        height = max(1, self.graph_help_rows)
+        maximum = max(0, len(GRAPH_HELP) - height)
+        if (event == 'escape' or event == 'function' and value == 1
+                or event == 'key' and value in ('q', '\x03')):
+            self.graph_help = False
+            return
+        if event in ('scroll', 'cursor'):
+            step = value if event == 'scroll' else (1 if value > 0 else -1)
+            self.graph_help_offset += step
+        elif event == 'page':
+            self.graph_help_offset += value * height
+        elif event == 'home':
+            self.graph_help_offset = 0
+        elif event == 'end':
+            self.graph_help_offset = maximum
+        else:
+            return
+        self.graph_help_offset = max(0, min(maximum, self.graph_help_offset))
+
+    def draw_graph_help(self, cols, rows, wrap, top):
+        output = ['\033[?25l']
+
+        def put(row, value, style=TEXT):
+            if top < row <= rows:
+                output.append(f'\033[{row};1H' + BASE + ' ' * cols)
+                output.append(f'\033[{row};1H' + BASE + style + wrap(value, cols)[0])
+
+        for row in range(top + 1, rows + 1):
+            put(row, '')
+        put(top + 1, ' Graph help | F1 or Esc close | Up/Down, PgUp/PgDn scroll ', ACCENT)
+        height = max(0, rows - top - 2)
+        self.graph_help_rows = height
+        maximum = max(0, len(GRAPH_HELP) - height)
+        self.graph_help_offset = max(0, min(maximum, self.graph_help_offset))
+        for number, line in enumerate(
+                GRAPH_HELP[self.graph_help_offset:self.graph_help_offset + height], 1):
+            put(top + 1 + number, line)
+        first = self.graph_help_offset + 1 if GRAPH_HELP else 0
+        last = min(len(GRAPH_HELP), self.graph_help_offset + height)
+        put(rows, f' Lines {first}-{last} of {len(GRAPH_HELP)} | F1/Esc close ', MUTED)
+        return ''.join(output)
 
     def graph_event(self, event, value):
         key, source, index = self.graph_focus
@@ -1095,7 +1175,7 @@ class ScratchpadPanel:
                     cy = (my - dt) / max(1, db - dt + 1)
                     graph.zoom('x', factor, cx)
                     graph.zoom('y', factor, cy)
-                    self.graph_values[key] = dict(graph.values)
+                    self.graph_values[key] = graph.saved_values()
                     self.save_position()
                     return
         if event == 'page':
@@ -1109,7 +1189,7 @@ class ScratchpadPanel:
                 cx, cy = 0.5, 0.5
             graph.zoom('x', factor, cx)
             graph.zoom('y', factor, cy)
-            self.graph_values[key] = dict(graph.values)
+            self.graph_values[key] = graph.saved_values()
             self.save_position()
             return
         if event == 'key' and value in ('-', '='):
@@ -1122,7 +1202,7 @@ class ScratchpadPanel:
                 cy = 0.5
             graph.zoom('x', factor, cx)
             graph.zoom('y', factor, cy)
-            self.graph_values[key] = dict(graph.values)
+            self.graph_values[key] = graph.saved_values()
             self.save_position()
             return
         if not controls:
@@ -1135,7 +1215,7 @@ class ScratchpadPanel:
             lo, hi = graph.ranges[name]
             fraction = (graph.values[name] - lo) / (hi - lo)
             graph.adjust(name, 0 if event == 'home' else 1 if event == 'end' else fraction + value * .01)
-            self.graph_values[key] = dict(graph.values)
+            self.graph_values[key] = graph.saved_values()
             self.save_position()
         elif event in ('click', 'drag'):
             x, y = value
@@ -1143,7 +1223,7 @@ class ScratchpadPanel:
                 rrow, rleft, rright = self.graph_reset_zone
                 if y == rrow and rleft <= x <= rright:
                     graph.reset_origin()
-                    self.graph_values[key] = dict(graph.values)
+                    self.graph_values[key] = graph.saved_values()
                     self.save_position()
                     return
             rect = self.graph_draw_rect
@@ -1162,7 +1242,7 @@ class ScratchpadPanel:
                     draw_h = max(1, db - dt + 1)
                     graph.pan('x', dx / inner_w)
                     graph.pan('y', dy / draw_h)
-                    self.graph_values[key] = dict(graph.values)
+                    self.graph_values[key] = graph.saved_values()
                     self.save_position()
                     self.graph_drag_start = (x, y, dict(graph.axis_views))
                     return
@@ -1170,7 +1250,7 @@ class ScratchpadPanel:
                 if row == y:
                     self.graph_slider = number
                     graph.adjust(controls[number], (x - left) / max(1, right - left))
-                    self.graph_values[key] = dict(graph.values)
+                    self.graph_values[key] = graph.saved_values()
                     self.save_position()
                     break
 
@@ -1254,7 +1334,7 @@ class ScratchpadPanel:
             put(row, prefix + track + suffix, ACCENT if number == self.graph_slider else MUTED)
             self.graph_zones.append((row, len(prefix) + 1, len(prefix) + track_width, number))
         put(rows - 1, self.message if self.message.startswith('Could not') else ' Parameters reshape curves; axis handles set the visible x/y range.', MUTED)
-        put(rows, ' Drag to pan | - / + zoom | Tab/Up/Down slider | Left/Right adjust | Home/End bounds | e edit | Esc close', MUTED)
+        put(rows, ' Drag to pan | - / + zoom | Tab/Up/Down slider | Left/Right adjust | Home/End bounds | F1 help | e edit | Esc close', MUTED)
         return ''.join(output)
 
     def _can_interact(self, block):
@@ -1455,7 +1535,16 @@ class ScratchpadPanel:
     def event(self, event, value):
         self._last_activity = time.monotonic()
         if event == 'function' and value == 1:
+            if self.inspector.focus is None and (
+                    self.graph_help or self.graph_focus is not None
+                    or any(block[0] <= self.cursor <= block[2]
+                           for block in self.graph_blocks())):
+                self.toggle_graph_help()
+                return
             self.toggle_inspector()
+            return
+        if self.graph_help:
+            self.graph_help_event(event, value)
             return
         if self.inspector.focus is not None:
             if event == 'escape':
@@ -1779,7 +1868,7 @@ class ScratchpadPanel:
                         start = end + 1
                         end = self.text.find('\n', start)
                         end = len(self.text) if end < 0 else end
-                self.cursor = min(start + column, end)
+                self.cursor = self._skip_collapsed_graphs(min(start + column, end), value)
             if selecting:
                 if self.anchor is None:
                     self.anchor = previous
@@ -1904,6 +1993,8 @@ class ScratchpadPanel:
             self._draw_text_version = self.text_version
         if cols <= 0 or rows <= top:
             return ''
+        if self.graph_help:
+            return self.draw_graph_help(cols, rows, wrap, top)
         if self.graph_focus is not None:
             return self.draw_graph(cols, rows, wrap, top)
         output = ['\033[?25l']
@@ -1923,7 +2014,7 @@ class ScratchpadPanel:
         self.zones.append((top + 2, 14, 22, 'tab_shared', None))
         hint_cols = cols - len(tab_line) - 2
         if hint_cols > 40:
-            hint = f' | F1 inspect | Ctrl+E fold | Ctrl+C/X/V clipboard | click tabs | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find'
+            hint = f' | F1 inspect/help | Ctrl+E fold | Ctrl+C/X/V clipboard | click tabs | Ctrl+Z/Y undo/redo | /new /graph /capture | Ctrl+F find'
             put(top + 2, len(tab_line) + 2, hint, cols, MUTED)
         elif hint_cols > 10:
             hint = f' | 1/2 tab | click host/port'

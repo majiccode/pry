@@ -364,17 +364,32 @@ example into `notes.md` and opens an interactive Unicode block graph:
 
 ```graph
 x_axis=[-2..2]
-y_axis=[-2..2]
-a=[-1..1]
+y_axis=[-2.5..2.5]
+
+# animated waves: several coloured curves on one set of axes
+a=[0.2..1.5]
 a=1
-y=sin(x*tau)*a
-plot(y)
+wave=sin(x*tau+time)*a
+echo=cos(x*tau*2-time)*a*0.7
+plot(cyan: wave, orange: echo)
+
+# parametric orbit: t sweeps the curve, time animates it
 t=[0..1]
-plotxy(cos(t*tau),sin(t*tau))
-r=[0..2]
+amp=[0.2..1.5]
+amp=1
+plotxy(magenta: sin(3*t*tau+time)*amp, cos(2*t*tau+time)*amp)
+
+# rotating vectors: each argument gets its own colour
+spin=[[cos(time),-sin(time)],[sin(time),cos(time)]]
+v=matmul(spin,[1.5,0.5])
+w=matmul(spin,[-0.5,1.2])
+plotvec(blue: v, green: w, yellow: [1.5,0.5])
+
+# implicit circle with an adjustable radius
+r=[0.5..2]
 r=1
 f=x^2+y^2-r^2
-plot(f)
+plot(red: f)
 ```
 
 Graph blocks are ordinary fenced Markdown using the `graph` language tag. Each
@@ -405,16 +420,51 @@ it; dependencies use the last definition in that snapshot. A definition may
 refer to its own previous value. Add more `plot(...)` statements for additional
 previews; `[` and `]` switch plots in the expanded view. Slider values persist in
 `pry-state.json`, keyed by block contents, so editing a block resets its controls
-to its defaults.
+to its defaults. Zoom and pan are session-only; reopening the note restores the
+declared axis ranges.
 
 Use `[lo..hi]` to declare ranges, and a subsequent constant assignment to set a
 slider's initial value (otherwise it starts at the midpoint). Without explicit
 axis bounds, ranges are calculated from the sampled curve.
 Arithmetic supports `+ - * / % **` and `^` for powers, parentheses, `pi`, `e`,
-`tau` (or uppercase `PI`, `E`, `TAU`), and functions including `sin`, `cos`, `tan`, `sqrt`, `log`, `exp`, `abs`,
-`min`, and `max`. Statements can be on separate lines or separated by semicolons;
-`#` starts a comment. Invalid expressions show a line-specific error. Domain
-errors produce gaps. Evaluation is bounded and does not execute Python code.
+`tau` (or uppercase `PI`, `E`, `TAU`), and scalar functions including `sin`,
+`cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sqrt`, `cbrt`, `exp`, `log`,
+`log2`, `log10`, `abs`, `floor`, `ceil`, `round`, `min`, `max`, and `clamp`.
+Functions apply elementwise to vectors and matrices.
+
+Vectors and matrices are written as literals: `v=[1,2]` and
+`m=[[1,2],[3,4]]`. Use `plotvec(v,...)` to draw 2D vectors as arrows from the
+origin. Each argument is one colored series, so `plotvec(a,b)` draws two
+vectors and `plotvec(vs)` accepts a list or matrix of vectors. A four-component
+vector `[x0,y0,x1,y1]` draws a directed segment instead of an origin vector.
+Vector and matrix operations include `vec`, `dot`, `cross`, `norm`/`length`,
+`normalize`/`unit`, `angle`, `sum`, `mean`, `prod`, `rows`, `cols`,
+`transpose`, `det`, `inverse`, `matmul`, `identity`, and `rotate`. Scalar
+multiplication scales vectors and matrices; other arithmetic combines matching
+shapes elementwise.
+
+Prefix a plotted expression with a colour to set that curve, for example
+`plot(red: sin(x), cyan: cos(x))` or `plotvec(blue: a, red: b)`. Use
+`color=name` (or `colour=name`) to colour every curve, or repeat it to assign
+colours in order: `plot(a, b, color=red, color=blue)`. Named colours include
+red, orange, yellow, green, cyan, blue, purple, magenta, pink, white, gray,
+lime, teal, navy, gold, violet, brown, coral, salmon, turquoise, and silver.
+`color=196` selects an xterm-256 palette entry, while `color=0xff8800` or
+`color=rgb(255,136,0)` sets a true RGB colour.
+
+`time` is elapsed seconds since the graph opened and `dt` is the time since the
+previous animation frame. Use `time` for continuous motion, for example
+`y=sin(time*tau)`. Use `dt` when a formula needs the frame duration, for example
+`pace=clamp(dt*60,0,1)` is near 1 at 60 fps. A graph containing `time` or `dt`
+animates automatically while idle. These are formulas, not sliders, so their
+values are recalculated every frame.
+
+Press **F1** while the caret is inside a `graph` block (or in the expanded graph
+view) to open the graph help panel. It lists every declaration, plot form,
+function, and operator; Up/Down and PageUp/PageDown scroll, and F1 or Esc closes
+it. Statements can be on separate lines or separated by semicolons; `#` starts
+a comment. Invalid expressions show a line-specific error. Domain errors produce
+gaps. Evaluation is bounded and does not execute Python code.
 Graphs render through Kitty, iTerm2, or Sixel graphics when the terminal
 supports one, using true pixels and per-curve colors. Terminals without a
 supported graphics protocol fall back to Unicode blocks: 2-by-3 sextants where

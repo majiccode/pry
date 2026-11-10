@@ -16,6 +16,10 @@ Simple plots let the graph work out what to draw:
     plotxy(cos(t*tau), sin(t*tau))   # parametric
     f=x^2+y^2-1
     plot(f)              # implicit f(x,y)=0
+    a=[3,1]
+    b=[-1,2]
+    plotvec(a,b)         # 2D arrows, one color per argument
+    plotvec([[1,0],[0.5,0.5]])       # a list of vectors
 
 `plot(x)` and `plot(y)` also understand `x=f(y)` and `y=f(x)` when the
 expression uses the plane coordinate directly. `plot(a,b,...)` draws all of
@@ -46,34 +50,73 @@ from tui_theme import ACCENT, BACKGROUND, BASE, BORDER, MUTED, SECONDARY, SUCCES
 
 
 EXAMPLE_SOURCE = """x_axis=[-2..2]
-y_axis=[-3..11]
-a=[-1..1]
+y_axis=[-2.5..2.5]
+
+# animated waves: several coloured curves on one set of axes
+a=[0.2..1.5]
 a=1
-y=sin(x*tau)*a
-plot(y)
+wave=sin(x*tau+time)*a
+echo=cos(x*tau*2-time)*a*0.7
+plot(cyan: wave, orange: echo)
 
-# time is elapsed seconds since the graph opened (smooth: sin(time) sweeps 0..2pi over ~6.3s)
-# dt is delta-seconds since the last frame (~0.016s at 60fps; use for decay like a = a * (1 - dt))
-v=5+5*sin(time)
-plot(v)
-
+# parametric orbit: t sweeps the curve, time animates it
 t=[0..1]
-plotxy(cos(t*tau),sin(t*tau))
-r=[0..2]
+amp=[0.2..1.5]
+amp=1
+plotxy(magenta: sin(3*t*tau+time)*amp, cos(2*t*tau+time)*amp)
+
+# rotating vectors: each argument gets its own colour
+spin=[[cos(time),-sin(time)],[sin(time),cos(time)]]
+v=matmul(spin,[1.5,0.5])
+w=matmul(spin,[-0.5,1.2])
+plotvec(blue: v, green: w, yellow: [1.5,0.5])
+
+# implicit circle with an adjustable radius
+r=[0.5..2]
 r=1
 f=x^2+y^2-r^2
-plot(f)"""
+plot(red: f)"""
 
 _LIMIT = 1e100
+
+
+def _cbrt(value):
+    return -((-value) ** (1 / 3)) if value < 0 else value ** (1 / 3)
+
+
+# name: (callable, minimum args, maximum args, elementwise over vectors)
 _FUNCTIONS = {
-    'sin': (math.sin, 1, 1), 'cos': (math.cos, 1, 1),
-    'tan': (math.tan, 1, 1), 'asin': (math.asin, 1, 1),
-    'acos': (math.acos, 1, 1), 'atan': (math.atan, 1, 1),
-    'atan2': (math.atan2, 2, 2), 'sqrt': (math.sqrt, 1, 1),
-    'log': (math.log, 1, 2), 'log10': (math.log10, 1, 1),
-    'exp': (math.exp, 1, 1), 'abs': (abs, 1, 1),
-    'floor': (math.floor, 1, 1), 'ceil': (math.ceil, 1, 1),
-    'min': (min, 2, 16), 'max': (max, 2, 16),
+    'sin': (math.sin, 1, 1, True), 'cos': (math.cos, 1, 1, True),
+    'tan': (math.tan, 1, 1, True), 'asin': (math.asin, 1, 1, True),
+    'acos': (math.acos, 1, 1, True), 'atan': (math.atan, 1, 1, True),
+    'atan2': (math.atan2, 2, 2, True),
+    'sec': (lambda x: 1 / math.cos(x), 1, 1, True),
+    'csc': (lambda x: 1 / math.sin(x), 1, 1, True),
+    'cot': (lambda x: 1 / math.tan(x), 1, 1, True),
+    'sqrt': (math.sqrt, 1, 1, True),
+    'cbrt': (_cbrt, 1, 1, True),
+    'log': (math.log, 1, 2, True), 'log10': (math.log10, 1, 1, True),
+    'log2': (math.log2, 1, 1, True), 'log1p': (math.log1p, 1, 1, True),
+    'exp': (math.exp, 1, 1, True), 'expm1': (math.expm1, 1, 1, True),
+    'sinh': (math.sinh, 1, 1, True), 'cosh': (math.cosh, 1, 1, True),
+    'tanh': (math.tanh, 1, 1, True), 'asinh': (math.asinh, 1, 1, True),
+    'acosh': (math.acosh, 1, 1, True), 'atanh': (math.atanh, 1, 1, True),
+    'abs': (abs, 1, 1, True), 'sign': (lambda x: (x > 0) - (x < 0), 1, 1, True),
+    'floor': (math.floor, 1, 1, True), 'ceil': (math.ceil, 1, 1, True),
+    'round': (round, 1, 1, True), 'trunc': (math.trunc, 1, 1, True),
+    'pow': (operator.pow, 2, 2, True), 'hypot': (math.hypot, 2, 2, True),
+    'degrees': (math.degrees, 1, 1, True), 'radians': (math.radians, 1, 1, True),
+    'min': (min, 2, 16, False), 'max': (max, 2, 16, False),
+    'clamp': (lambda x, lo, hi: max(lo, min(hi, x)), 3, 3, True),
+}
+_VECTOR_FUNCTIONS = {
+    'vec': (2, 3), 'vector': (2, 3), 'dot': (2, 2), 'cross': (2, 2),
+    'norm': (1, 1), 'length': (1, 1), 'mag': (1, 1),
+    'normalize': (1, 1), 'unit': (1, 1), 'angle': (1, 2),
+    'sum': (1, 1), 'mean': (1, 1), 'prod': (1, 1),
+    'rows': (1, 1), 'cols': (1, 1), 'transpose': (1, 1),
+    'det': (1, 1), 'determinant': (1, 1), 'inverse': (1, 1), 'inv': (1, 1),
+    'matmul': (2, 2), 'identity': (1, 1), 'rotate': (2, 2),
 }
 _CONSTANTS = {'pi': math.pi, 'PI': math.pi, 'e': math.e, 'E': math.e,
               'tau': math.tau, 'TAU': math.tau}
@@ -83,6 +126,20 @@ _BINARY = {ast.Add: operator.add, ast.Sub: operator.sub,
 _PALETTE = (SECONDARY, SUCCESS, WARNING, '\033[38;5;213m',
             '\033[38;5;81m', '\033[38;5;203m', '\033[38;5;229m',
             '\033[38;5;141m')
+_COLORS = {
+    'red': '\033[38;5;203m', 'orange': '\033[38;5;215m',
+    'yellow': '\033[38;5;229m', 'green': '\033[38;5;150m',
+    'cyan': '\033[38;5;81m', 'blue': '\033[38;5;110m',
+    'purple': '\033[38;5;141m', 'magenta': '\033[38;5;213m',
+    'pink': '\033[38;5;218m', 'white': '\033[38;5;252m',
+    'black': '\033[38;5;232m', 'gray': '\033[38;5;245m',
+    'grey': '\033[38;5;245m', 'lime': '\033[38;5;118m',
+    'teal': '\033[38;5;37m', 'navy': '\033[38;5;25m',
+    'gold': '\033[38;5;220m', 'violet': '\033[38;5;129m',
+    'brown': '\033[38;5;130m', 'coral': '\033[38;5;209m',
+    'salmon': '\033[38;5;216m', 'turquoise': '\033[38;5;80m',
+    'silver': '\033[38;5;250m',
+}
 _PAN_SENSITIVITY = 0.3
 _NAME = r'[A-Za-z_][A-Za-z_0-9]{0,31}'
 _QUADRANTS = (' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛',
@@ -102,6 +159,86 @@ _AXIS_DECLARATIONS = {'axisx': 'x', 'axisy': 'y', 'x_axis': 'x', 'y_axis': 'y',
                       'xrange': 'x', 'yrange': 'y'}
 _AXIS_CONTROL_SUFFIX = {'.min': 0, '.max': 1}
 
+GRAPH_HELP = (
+    'Graph expressions - F1/Esc close, Up/Down scroll',
+    '',
+    'DECLARATIONS',
+    '  a=[lo..hi]          slider range',
+    '  a=value             slider initial value (must be constant)',
+    '  f=expression        formula used by later plot(...) calls',
+    '  v=[1,2]             2D vector literal',
+    '  m=[[1,2],[3,4]]     matrix literal (rows of numbers)',
+    '',
+    'PLOTS',
+    '  plot(expr,...)          y=f(x); x/y coordinates make an implicit curve',
+    '  plotxy(xexpr,yexpr)     parametric curve',
+    '  plotvec(v,...)           arrows from the origin, one color per argument',
+    '  plotvec([[1,2],[3,4]])  a list of vectors',
+    '  plotvec([x0,y0,x1,y1])  a directed segment',
+    '',
+    'COLOURS',
+    '  plot(red: sin(x), cyan: cos(x))   colour each curve',
+    '  plot(sin(x), cos(x), color=orange) same colour for all',
+    '  plot(a, b, color=red, color=blue) one colour per curve',
+    '  plotvec(blue: v, red: w)          colour vector lists',
+    '  names: red orange yellow green cyan blue purple magenta',
+    '         pink white gray lime teal navy gold violet brown',
+    '         coral salmon turquoise silver',
+    '  also color=196 (xterm-256) or color=0xff8800 / rgb(255,136,0)',
+    '',
+    'CONSTANTS',
+    '  pi  tau  e            (uppercase PI, TAU, E also work)',
+    '',
+    'ARITHMETIC',
+    '  +  -  *  /  %  **  ^   ^ means power',
+    '  scalar*vector and vector/scalar scale; vectors otherwise combine',
+    '  element by element and must have matching shapes',
+    '',
+    'SCALAR FUNCTIONS (also applied elementwise to vectors/matrices)',
+    '  sin cos tan sec csc cot asin acos atan atan2',
+    '  sinh cosh tanh asinh acosh atanh',
+    '  sqrt cbrt exp expm1 log log2 log10 log1p',
+    '  abs sign floor ceil round trunc',
+    '  pow hypot degrees radians clamp',
+    '  min max (two or more scalar arguments)',
+    '',
+    'VECTOR AND MATRIX FUNCTIONS',
+    '  vec(x,y)  vector(x,y)      build a vector (2 or 3 components)',
+    '  dot(a,b)                   dot product',
+    '  cross(a,b)                 2D scalar or 3D vector cross product',
+    '  norm(v)  length(v)  mag(v) Euclidean length',
+    '  normalize(v)  unit(v)      unit vector',
+    '  angle(v)  angle(a,b)        direction angle or angle between vectors',
+    '  sum(v)  mean(v)  prod(v)   aggregate all components',
+    '  rows(m)  cols(m)           matrix dimensions',
+    '  transpose(m)               swap matrix rows and columns',
+    '  det(m)  inverse(m)         determinant / inverse (2x2, 3x3)',
+    '  matmul(a,b)                matrix*matrix, matrix*vector, vector*matrix',
+    '  identity(n)                n x n identity matrix',
+    '  rotate(v,angle)            rotate a 2D vector',
+    '',
+    'ANIMATION',
+    '  time                       elapsed seconds since the graph opened',
+    '  dt                         seconds since the previous frame (~0.016)',
+    '  time drives motion: y=sin(time*tau)',
+    '  dt is the frame duration: pace=clamp(dt*60,0,1)',
+    '  plot(cyan: y, purple: pace)',
+    '',
+    'EXAMPLES',
+    '  a=[3,1]',
+    '  b=[-1,2]',
+    '  plotvec(red: a, blue: b, green: a+b)',
+    '  plot(red: sin(x), cyan: cos(x))',
+    '  s=a+b',
+    '  plotvec(s)',
+    '  vs=[[1,0],[0.7,0.7],[-1,1]]',
+    '  plotvec(vs)',
+    '  t=[0..1]',
+    '  plotvec([cos(t*tau),sin(t*tau)])',
+    '  v=5+5*sin(time)',
+    '  plot(v)',
+)
+
 
 class _BudgetExceeded(Exception):
     pass
@@ -112,12 +249,246 @@ def _error(line, message):
 
 
 def _finite(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is not int and type(value) is not float:
         raise ValueError('expected a real number')
     value = float(value)
-    if not math.isfinite(value) or abs(value) > _LIMIT:
+    if not -_LIMIT <= value <= _LIMIT:
         raise ValueError('number is non-finite or exceeds 1e100')
     return value
+
+
+def _value(value):
+    """Validate and normalise a scalar, vector, or matrix result."""
+    if isinstance(value, bool):
+        raise ValueError('expected a real number')
+    if isinstance(value, (int, float)):
+        return _finite(value)
+    if isinstance(value, (list, tuple)):
+        if not 1 <= len(value) <= 32:
+            raise ValueError('vector or matrix must have 1..32 entries')
+        if all(isinstance(item, (int, float)) and not isinstance(item, bool)
+               for item in value):
+            return tuple(_finite(item) for item in value)
+        if all(isinstance(item, (list, tuple)) for item in value):
+            rows = tuple(_value(item) for item in value)
+            if not all(isinstance(row, tuple) and row
+                       and not isinstance(row[0], tuple) for row in rows):
+                raise ValueError('matrices may only contain vectors')
+            width = len(rows[0])
+            if any(len(row) != width for row in rows):
+                raise ValueError('matrix rows must have equal length')
+            return rows
+    raise ValueError('expected a number, vector, or matrix')
+
+
+def _is_sequence(value):
+    return type(value) is tuple
+
+
+def _same_shape(left, right):
+    if _is_sequence(left) != _is_sequence(right):
+        return False
+    if not _is_sequence(left):
+        return True
+    return (len(left) == len(right)
+            and all(_same_shape(a, b) for a, b in zip(left, right)))
+
+
+def _scale(value, factor):
+    factor = _finite(factor)
+    if _is_sequence(value):
+        return tuple(_scale(item, factor) for item in value)
+    return _finite(value * factor)
+
+
+def _zip_values(left, right, function):
+    if _is_sequence(left) or _is_sequence(right):
+        if not _same_shape(left, right):
+            raise ValueError('vector or matrix shapes do not match')
+        return tuple(_zip_values(a, b, function) for a, b in zip(left, right))
+    return _finite(function(left, right))
+
+
+def _broadcast(function, args):
+    sequence = next((arg for arg in args if _is_sequence(arg)), None)
+    if sequence is None:
+        return _finite(function(*args))
+    for arg in args:
+        if _is_sequence(arg) and not _same_shape(arg, sequence):
+            raise ValueError('vector or matrix shapes do not match')
+    if sequence and _is_sequence(sequence[0]):
+        return tuple(_broadcast(function, [arg[index] if _is_sequence(arg) else arg
+                                          for arg in args])
+                     for index in range(len(sequence)))
+    return tuple(_finite(function(*(arg[index] if _is_sequence(arg) else arg
+                                   for arg in args)))
+                 for index in range(len(sequence)))
+
+
+def _as_vector(value, size=None):
+    if not _is_sequence(value) or (value and _is_sequence(value[0])):
+        raise ValueError('expected a vector')
+    if size is not None and len(value) != size:
+        raise ValueError(f'expected a {size}D vector')
+    return value
+
+
+def _as_matrix(value):
+    if _is_sequence(value) and value and _is_sequence(value[0]):
+        width = len(value[0])
+        if not 2 <= len(value) <= 8 or not 1 <= width <= 8:
+            raise ValueError('matrix must be 2..8 by 1..8')
+        if any(len(row) != width for row in value):
+            raise ValueError('matrix rows must have equal length')
+        return value
+    raise ValueError('expected a matrix')
+
+
+def _flatten(value):
+    if _is_sequence(value):
+        for item in value:
+            yield from _flatten(item)
+    else:
+        yield value
+
+
+def _determinant(matrix):
+    size = len(matrix)
+    if size == 2:
+        return _finite(matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0])
+    if size == 3:
+        a, b, c = matrix
+        return _finite(a[0] * (b[1] * c[2] - b[2] * c[1])
+                       - a[1] * (b[0] * c[2] - b[2] * c[0])
+                       + a[2] * (b[0] * c[1] - b[1] * c[0]))
+    raise ValueError('determinant supports 2x2 and 3x3 matrices')
+
+
+def _inverse(matrix):
+    size = len(matrix)
+    if size == 2:
+        det = _determinant(matrix)
+        if det == 0:
+            raise ValueError('matrix is singular')
+        return ((_finite(matrix[1][1] / det), _finite(-matrix[0][1] / det)),
+                (_finite(-matrix[1][0] / det), _finite(matrix[0][0] / det)))
+    if size == 3:
+        a, b, c = matrix
+        det = _determinant(matrix)
+        if det == 0:
+            raise ValueError('matrix is singular')
+        cofactors = (
+            (b[1] * c[2] - b[2] * c[1], b[2] * c[0] - b[0] * c[2], b[0] * c[1] - b[1] * c[0]),
+            (a[2] * c[1] - a[1] * c[2], a[0] * c[2] - a[2] * c[0], a[1] * c[0] - a[0] * c[1]),
+            (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]),
+        )
+        return tuple(tuple(_finite(cofactors[column][row] / det)
+                           for column in range(3)) for row in range(3))
+    raise ValueError('inverse supports 2x2 and 3x3 matrices')
+
+
+def _vector_call(name, args):
+    if name in ('vec', 'vector'):
+        vector = tuple(_finite(value) for value in args)
+        return vector
+    if name == 'dot':
+        left, right = _as_vector(args[0]), _as_vector(args[1])
+        if len(left) != len(right):
+            raise ValueError('dot product vectors must have equal length')
+        return _finite(sum(a * b for a, b in zip(left, right)))
+    if name == 'cross':
+        left, right = _as_vector(args[0]), _as_vector(args[1])
+        if len(left) == 2 and len(right) == 2:
+            return _finite(left[0] * right[1] - left[1] * right[0])
+        if len(left) == 3 and len(right) == 3:
+            return (_finite(left[1] * right[2] - left[2] * right[1]),
+                    _finite(left[2] * right[0] - left[0] * right[2]),
+                    _finite(left[0] * right[1] - left[1] * right[0]))
+        raise ValueError('cross product supports two 2D or two 3D vectors')
+    if name in ('norm', 'length', 'mag'):
+        vector = _as_vector(args[0])
+        return _finite(math.sqrt(sum(value * value for value in vector)))
+    if name in ('normalize', 'unit'):
+        vector = _as_vector(args[0])
+        magnitude = math.sqrt(sum(value * value for value in vector))
+        if magnitude == 0:
+            raise ValueError('cannot normalise a zero vector')
+        return tuple(_finite(value / magnitude) for value in vector)
+    if name == 'angle':
+        if len(args) == 1:
+            vector = _as_vector(args[0], 2)
+            return _finite(math.atan2(vector[1], vector[0]))
+        left, right = _as_vector(args[0]), _as_vector(args[1])
+        if len(left) != len(right):
+            raise ValueError('angle vectors must have equal length')
+        denominator = math.sqrt(sum(v * v for v in left)) * math.sqrt(sum(v * v for v in right))
+        if denominator == 0:
+            raise ValueError('angle requires non-zero vectors')
+        cosine = max(-1.0, min(1.0, sum(a * b for a, b in zip(left, right)) / denominator))
+        return _finite(math.acos(cosine))
+    if name in ('sum', 'mean', 'prod'):
+        values = list(_flatten(args[0]))
+        if name == 'sum':
+            return _finite(sum(values))
+        if name == 'prod':
+            result = 1.0
+            for value in values:
+                result *= value
+            return _finite(result)
+        return _finite(sum(values) / len(values))
+    if name == 'rows':
+        return float(len(args[0])) if _is_sequence(args[0]) else 1.0
+    if name == 'cols':
+        value = args[0]
+        return float(len(value[0])) if _is_sequence(value) and value and _is_sequence(value[0]) else (
+            float(len(value)) if _is_sequence(value) else 1.0)
+    if name == 'transpose':
+        matrix = _as_matrix(args[0])
+        return tuple(tuple(row[column] for row in matrix) for column in range(len(matrix[0])))
+    if name in ('det', 'determinant'):
+        return _determinant(_as_matrix(args[0]))
+    if name in ('inverse', 'inv'):
+        return _inverse(_as_matrix(args[0]))
+    if name == 'identity':
+        requested = _finite(args[0])
+        if not requested.is_integer():
+            raise ValueError('identity size must be an integer')
+        size = int(requested)
+        if not 1 <= size <= 8:
+            raise ValueError('identity size must be 1..8')
+        return tuple(tuple(1.0 if row == column else 0.0 for column in range(size))
+                     for row in range(size))
+    if name == 'matmul':
+        left, right = args
+        if _is_sequence(left) and left and _is_sequence(left[0]):
+            matrix = _as_matrix(left)
+            if _is_sequence(right) and right and _is_sequence(right[0]):
+                other = _as_matrix(right)
+                if len(matrix[0]) != len(other):
+                    raise ValueError('matrix dimensions do not match')
+                return tuple(tuple(_finite(sum(matrix[row][k] * other[k][column]
+                                               for k in range(len(other))))
+                                   for column in range(len(other[0])))
+                             for row in range(len(matrix)))
+            vector = _as_vector(right)
+            if len(matrix[0]) != len(vector):
+                raise ValueError('matrix and vector dimensions do not match')
+            return tuple(_finite(sum(value * vector[index] for index, value in enumerate(row)))
+                         for row in matrix)
+        vector = _as_vector(left)
+        matrix = _as_matrix(right)
+        if len(vector) != len(matrix):
+            raise ValueError('vector and matrix dimensions do not match')
+        return tuple(_finite(sum(vector[row] * matrix[row][column]
+                                 for row in range(len(vector))))
+                     for column in range(len(matrix[0])))
+    if name == 'rotate':
+        vector = _as_vector(args[0], 2)
+        angle = _finite(args[1])
+        cosine, sine = math.cos(angle), math.sin(angle)
+        return (_finite(vector[0] * cosine - vector[1] * sine),
+                _finite(vector[0] * sine + vector[1] * cosine))
+    raise ValueError(f'unknown function {name}')
 
 
 @dataclass(frozen=True)
@@ -143,6 +514,7 @@ class _Curve:
     sweep_axis: str = 'x'
     domain: tuple = None
     line: int = 1
+    color: str = None
 
 
 @dataclass
@@ -248,13 +620,22 @@ def _expression(text, line, node_count):
             if node.id not in _CONSTANTS:
                 names.add(node.id)
             children = ()
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            if not 1 <= len(node.elts) <= 32:
+                raise _error(line, 'vector or matrix literals must have 1..32 entries')
+            children = tuple(node.elts)
         elif isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
             children = (node.left, node.right)
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
             children = (node.operand,)
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            spec = _FUNCTIONS.get(node.func.id)
-            if spec is None or node.keywords or not spec[1] <= len(node.args) <= spec[2]:
+            name = node.func.id
+            if name in _VECTOR_FUNCTIONS:
+                minimum, maximum = _VECTOR_FUNCTIONS[name]
+            else:
+                spec = _FUNCTIONS.get(name)
+                minimum, maximum = (spec[1], spec[2]) if spec else (1, 0)
+            if node.keywords or not minimum <= len(node.args) <= maximum:
                 raise _error(line, 'unknown function or invalid argument count')
             children = node.args
         else:
@@ -268,29 +649,96 @@ def _evaluate(node, resolve, budget):
     if budget[0] < 0:
         raise _BudgetExceeded
     if isinstance(node, ast.Constant):
-        return float(node.value)
+        return _finite(node.value)
     if isinstance(node, ast.Name):
         return _CONSTANTS[node.id] if node.id in _CONSTANTS else resolve(node.id)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return _value(tuple(_evaluate(element, resolve, budget) for element in node.elts))
     if isinstance(node, ast.UnaryOp):
         value = _evaluate(node.operand, resolve, budget)
-        return -value if isinstance(node.op, ast.USub) else value
+        if isinstance(node.op, ast.UAdd):
+            return value
+        return _scale(value, -1) if _is_sequence(value) else _finite(-value)
     if isinstance(node, ast.BinOp):
         left = _evaluate(node.left, resolve, budget)
         right = _evaluate(node.right, resolve, budget)
-        if isinstance(node.op, ast.Pow) and abs(right) > 128:
-            raise ValueError('exponent exceeds 128')
-        return _finite(_BINARY[type(node.op)](left, right))
+        if isinstance(node.op, ast.Pow):
+            if _is_sequence(left) or _is_sequence(right):
+                raise ValueError('powers require scalar operands')
+            if abs(right) > 128:
+                raise ValueError('exponent exceeds 128')
+        if isinstance(node.op, ast.Mod) and (_is_sequence(left) or _is_sequence(right)):
+            raise ValueError('modulo requires scalar operands')
+        if isinstance(node.op, ast.Mult):
+            if _is_sequence(left) and not _is_sequence(right):
+                return _scale(left, right)
+            if _is_sequence(right) and not _is_sequence(left):
+                return _scale(right, left)
+        if isinstance(node.op, ast.Div) and _is_sequence(left) and not _is_sequence(right):
+            return _scale(left, 1 / _finite(right))
+        if not _is_sequence(left) and not _is_sequence(right):
+            return _finite(_BINARY[type(node.op)](left, right))
+        return _zip_values(left, right, _BINARY[type(node.op)])
     args = [_evaluate(arg, resolve, budget) for arg in node.args]
-    return _finite(_FUNCTIONS[node.func.id][0](*args))
+    name = node.func.id
+    if name in _VECTOR_FUNCTIONS:
+        return _value(_vector_call(name, args))
+    function, _, _, elementwise = _FUNCTIONS[name]
+    if elementwise:
+        if not any(_is_sequence(arg) for arg in args):
+            return _finite(function(*args))
+        return _value(_broadcast(function, args))
+    if any(_is_sequence(arg) for arg in args):
+        raise ValueError(f'{name} requires scalar arguments')
+    return _finite(function(*args))
 
 
 def _constant(expression):
     if expression.names:
         raise _error(expression.line, 'range endpoints and initial values must be constant')
     try:
-        return _evaluate(expression.node, lambda name: 0.0, [4096])
+        value = _evaluate(expression.node, lambda name: 0.0, [4096])
     except (ArithmeticError, ValueError, _BudgetExceeded) as exc:
         raise _error(expression.line, 'invalid constant expression') from exc
+    if _is_sequence(value):
+        raise _error(expression.line, 'range endpoints and initial values must be scalar')
+    return _finite(value)
+
+
+def _color_style(text, line):
+    key = text.strip().lower()
+    if key in _COLORS:
+        return _COLORS[key]
+    if key.startswith('0x'):
+        digits = key[2:]
+        if len(digits) == 3:
+            digits = ''.join(char * 2 for char in digits)
+        if len(digits) == 6:
+            try:
+                red, green, blue = (int(digits[index:index + 2], 16)
+                                    for index in (0, 2, 4))
+            except ValueError:
+                pass
+            else:
+                return f'\033[38;2;{red};{green};{blue}m'
+    match = re.fullmatch(r'rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)', key)
+    if match:
+        red, green, blue = (min(255, int(value)) for value in match.groups())
+        return f'\033[38;2;{red};{green};{blue}m'
+    if key.isdigit() and 0 <= int(key) <= 255:
+        return f'\033[38;5;{int(key)}m'
+    raise _error(line, f'unknown colour {text.strip()}')
+
+
+def _resolve_colors(explicit, defaults, count):
+    colors, default_index = [], 0
+    for index in range(count):
+        color = explicit[index] if index < len(explicit) else None
+        if color is None and defaults:
+            color = defaults[min(default_index, len(defaults) - 1)]
+            default_index += 1
+        colors.append(color)
+    return colors
 
 
 class _CellCanvas:
@@ -407,24 +855,26 @@ class Graph:
                 statement = statement.strip()
                 if not statement:
                     continue
-                plot_match = re.fullmatch(r'(plot|plotxy)\s*\((.*)\)', statement)
+                plot_match = re.fullmatch(
+                    r'(plot|plotxy|plotvec|plotvecs|plotvectors|quiver)\s*\((.*)\)', statement)
                 if plot_match:
-                    self._parse_plot(plot_match[1], plot_match[2], line,
+                    kind = 'plotvec' if plot_match[1] in ('plotvec', 'plotvecs', 'plotvectors', 'quiver') else plot_match[1]
+                    self._parse_plot(kind, plot_match[2], line,
                                      definitions, axes, node_count)
                     continue
                 match = re.fullmatch(rf'({_NAME})\s*=\s*(.+)', statement)
                 if not match:
                     raise _error(line, 'expected name=expression, name=[lo..hi], or plot(...)')
                 name, text = match.groups()
-                if name in _CONSTANTS or name in _FUNCTIONS or name in ('plot', 'plotxy', 'time', 'dt'):
+                if (name in _CONSTANTS or name in _FUNCTIONS or name in _VECTOR_FUNCTIONS
+                        or name in ('plot', 'plotxy', 'plotvec', 'plotvecs', 'plotvectors', 'quiver', 'time', 'dt')):
                     raise _error(line, f'reserved name {name}')
                 assignments += 1
                 if assignments > 96:
                     raise _error(line, 'at most 96 assignments are allowed')
-                if text.startswith('['):
-                    bounds = re.fullmatch(r'\[\s*(.+?)\s*\.\.\s*(.+?)\s*\]', text)
-                    if not bounds:
-                        raise _error(line, 'expected range [lo..hi]')
+                bounds = (re.fullmatch(r'\[\s*(.+?)\s*\.\.\s*(.+?)\s*\]', text)
+                          if text.startswith('[') else None)
+                if bounds:
                     lo, hi = (_constant(_expression(part, line, node_count)) for part in bounds.groups())
                     if lo >= hi:
                         raise _error(line, 'range lower bound must be less than upper bound')
@@ -470,6 +920,8 @@ class Graph:
         self._add_axis_controls()
         if isinstance(values, Mapping):
             for name in self.ranges:
+                if name in self.axis_controls:
+                    continue
                 value = values.get(name)
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     continue
@@ -487,10 +939,25 @@ class Graph:
     # parsing helpers
 
     def _parse_plot(self, kind, body, line, definitions, axes, node_count):
-        args = _split_args(body)
+        args, explicit, defaults = [], [], []
+        for raw in _split_args(body):
+            option = re.fullmatch(r'(?i)(?:color|colour)\s*=\s*(.+)', raw)
+            if option:
+                defaults.append(_color_style(option[1], line))
+                continue
+            color = None
+            prefix = re.fullmatch(r'\s*([^:]+?)\s*:\s*(.+)', raw)
+            if prefix:
+                color = _color_style(prefix[1], line)
+                raw = prefix[2]
+            args.append(raw)
+            explicit.append(color)
         if kind == 'plotxy':
             if len(args) != 2 or not all(args):
                 raise _error(line, 'use plotxy(x_expression, y_expression)')
+        elif kind == 'plotvec':
+            if not 1 <= len(args) <= 18 or not all(args):
+                raise _error(line, 'use plotvec(vector_expression, optional_vectors...)')
         else:
             if not 1 <= len(args) <= 18 or not all(args):
                 raise _error(line, 'use plot(expression, optional_expressions...)')
@@ -506,10 +973,11 @@ class Graph:
             parameters = tuple(args[2:])
             variants = definitions[output]
             old_domain = axes.get('x', self.ranges[sweep])
+            colors = _resolve_colors(explicit, defaults, len(variants))
             curves = tuple(_Curve(label=f'{output}#{index + 1}',
                                   expression=expression, name=output,
                                   variant=index, sweep=sweep, domain=old_domain,
-                                  line=expression.line)
+                                  line=expression.line, color=colors[index])
                            for index, expression in enumerate(variants))
             self.plots.append(_Plot(output, sweep, parameters,
                                     {k: tuple(v) for k, v in definitions.items()},
@@ -518,13 +986,26 @@ class Graph:
         specs = [self._plot_spec(arg, line, definitions, node_count) for arg in args]
         if kind == 'plotxy':
             xspec, yspec = specs
+            color = next((value for value in explicit if value is not None), None)
+            if color is None and defaults:
+                color = defaults[0]
             curve = _Curve(label=f'{xspec["label"]},{yspec["label"]}',
                            kind='parametric', xexpr=xspec['expr'], xname=xspec['name'],
-                           yexpr=yspec['expr'], yname=yspec['name'], line=line)
+                           yexpr=yspec['expr'], yname=yspec['name'], line=line,
+                           color=color)
             curves = (curve,)
             output = curve.label
+        elif kind == 'plotvec':
+            colors = _resolve_colors(explicit, defaults, len(specs))
+            curves = tuple(_Curve(label=spec['label'], kind='vector',
+                                  expression=spec['expr'], name=spec['name'],
+                                  line=line, color=colors[index])
+                           for index, spec in enumerate(specs))
+            output = ','.join(spec['label'] for spec in specs)
         else:
-            curves = tuple(self._curve_from_spec(spec, line, definitions) for spec in specs)
+            colors = _resolve_colors(explicit, defaults, len(specs))
+            curves = tuple(self._curve_from_spec(spec, line, definitions, colors[index])
+                           for index, spec in enumerate(specs))
             output = ','.join(spec['label'] for spec in specs)
         definitions_snapshot = {k: tuple(v) for k, v in definitions.items()}
         self.plots.append(_Plot(output, '', tuple(), definitions_snapshot,
@@ -537,7 +1018,7 @@ class Graph:
         return {'label': text, 'name': None,
                 'expr': _expression(text, line, node_count)}
 
-    def _curve_from_spec(self, spec, line, definitions):
+    def _curve_from_spec(self, spec, line, definitions, color=None):
         expression = spec['expr']
         name = spec['name']
         label = spec['label']
@@ -546,16 +1027,16 @@ class Graph:
             free.discard(name)
         if 'x' in free and 'y' in free:
             return _Curve(label=label, kind='implicit', expression=expression,
-                          name=name, line=line)
+                          name=name, line=line, color=color)
         if name == 'x' or ('y' in free and name != 'y'):
             # x=f(y): x is horizontal, the y plane coordinate is the domain.
             return _Curve(label=label, expression=expression, name=name,
                           orientation='x_of_y', sweep='y', sweep_axis='y',
-                          domain=self.axis_ranges.get('y'), line=line)
+                          domain=self.axis_ranges.get('y'), line=line, color=color)
         # y=f(x), or an unqualified function of the horizontal x coordinate.
         return _Curve(label=label, expression=expression, name=name,
                       orientation='y_of_x', sweep='x', sweep_axis='x',
-                      domain=self.axis_ranges.get('x'), line=line)
+                      domain=self.axis_ranges.get('x'), line=line, color=color)
 
     def _curve_ranges(self, plot, curve, skip=()):
         """Return the ranged variables reachable from a single curve."""
@@ -774,8 +1255,12 @@ class Graph:
             if curve.kind == 'parametric':
                 x = value(curve.xexpr, curve.xname)
                 y = value(curve.yexpr, curve.yname)
+                if _is_sequence(x) or _is_sequence(y):
+                    return None
                 return (x, y)
             result = value(curve.expression, curve.name, curve.variant)
+            if _is_sequence(result):
+                return None
             if curve.orientation == 'x_of_y':
                 return (result, u)
             return (u, result)
@@ -788,9 +1273,47 @@ class Graph:
         cache['y'] = y
         value = self._resolver(plot, cache, budget)
         try:
-            return value(curve.expression, curve.name)
+            result = value(curve.expression, curve.name)
+            return None if _is_sequence(result) else result
         except (ArithmeticError, ValueError, RecursionError):
             return None
+
+    def _eval_vector(self, plot, curve, budget):
+        cache = dict(self.values)
+        value = self._resolver(plot, cache, budget)
+        try:
+            result = value(curve.expression, curve.name, curve.variant)
+            return self._vector_segments(result)
+        except (ArithmeticError, ValueError, RecursionError):
+            return []
+
+    @staticmethod
+    def _vector_segments(value):
+        """Turn a vector or matrix into (tail, tip) pairs.
+
+        A single 2D/3D vector is drawn from the origin. A four-component vector
+        is treated as (x0, y0, x1, y1), a directed segment. A matrix or a list
+        of vectors contributes one segment per row.
+        """
+        if not _is_sequence(value) or (value and _is_sequence(value[0])):
+            rows = value
+        elif _is_sequence(value):
+            rows = (value,)
+        else:
+            raise ValueError('plotvec expects a vector or list of vectors')
+        if not _is_sequence(rows) or (rows and not _is_sequence(rows[0])):
+            raise ValueError('plotvec expects a vector or list of vectors')
+        segments = []
+        for row in rows:
+            if not _is_sequence(row) or (row and _is_sequence(row[0])):
+                raise ValueError('plotvec expects vectors of numbers')
+            if len(row) in (2, 3):
+                segments.append(((0.0, 0.0), (row[0], row[1])))
+            elif len(row) == 4:
+                segments.append(((row[0], row[1]), (row[2], row[3])))
+            else:
+                raise ValueError('plotvec vectors must have 2, 3, or 4 components')
+        return segments
 
     # ------------------------------------------------------------------
     # public API
@@ -802,6 +1325,38 @@ class Graph:
 
     def controls(self, plot_index=0):
         return list(self._plot(plot_index).controls)
+
+    def _plot_names(self, plot):
+        names = set()
+
+        def collect(expression):
+            for name in expression.names:
+                if name in names:
+                    continue
+                names.add(name)
+                for variant in plot.definitions.get(name, ()):
+                    collect(variant)
+
+        for curve in plot.curves:
+            for expression in (curve.expression, curve.xexpr, curve.yexpr):
+                if expression is not None:
+                    collect(expression)
+        return names
+
+    def animated(self, plot_index=0):
+        """Whether this plot depends on the built-in animation values."""
+        return bool(self._plot_names(self._plot(plot_index)) & {'time', 'dt'})
+
+    def cache_values(self, plot_index=0):
+        """Values that affect this plot, ignoring idle time for static plots."""
+        animated = self.animated(plot_index)
+        return tuple((name, value) for name, value in self.values.items()
+                     if animated or name not in ('time', 'dt'))
+
+    def saved_values(self):
+        """Persist slider values, not animation state or transient zoom views."""
+        return {name: value for name, value in self.values.items()
+                if name in self.ranges and name not in self.axis_controls}
 
     def sliders(self, plot_index=0):
         """Variable controls followed by the axis-range handles."""
@@ -1029,7 +1584,8 @@ class Graph:
         if len(labels) > 1 or plot.old:
             for index, label in enumerate(labels):
                 extra = f'{label}(L{plot.curves[index].line}) '
-                title += _PALETTE[index % len(_PALETTE)] + extra[:max(0, width - used)]
+                color = plot.curves[index].color or _PALETTE[index % len(_PALETTE)]
+                title += color + extra[:max(0, width - used)]
                 used = min(width, used + len(extra))
         return title + BASE
 
@@ -1050,16 +1606,31 @@ class Graph:
         exhausted = False
         if pixel_size is None:
             nx, ny = max(2, cols * sub_x), max(2, drawing_height * sub_y)
-            implicit_columns, implicit_rows = 120, 90
         else:
             nx = max(2, min(2000, int(pixel_size[0])))
             ny = max(2, min(2000, int(pixel_size[1])))
-            implicit_columns, implicit_rows = min(240, nx), min(180, ny)
+        implicit_columns = min(120, max(2, cols * sub_x))
+        implicit_rows = min(90, max(2, drawing_height * sub_y))
         sampled = []
         xs, ys = [], []
+        has_vectors = False
         if drawing_height:
             for curve in plot.curves:
                 if curve.kind == 'implicit':
+                    continue
+                if curve.kind == 'vector':
+                    try:
+                        segments = self._eval_vector(plot, curve, budget)
+                    except _BudgetExceeded:
+                        exhausted = True
+                        segments = []
+                    for tail, tip in segments:
+                        for x, y in (tail, tip):
+                            if math.isfinite(x) and math.isfinite(y):
+                                xs.append(x)
+                                ys.append(y)
+                    has_vectors = has_vectors or bool(segments)
+                    sampled.append((curve, segments, 'vector'))
                     continue
                 try:
                     points, domain = self._sample_points(plot, curve, nx, budget)
@@ -1073,7 +1644,10 @@ class Graph:
                     if math.isfinite(x) and math.isfinite(y):
                         xs.append(x)
                         ys.append(y)
-                sampled.append((curve, points, False))
+                sampled.append((curve, points, 'line'))
+        if has_vectors:
+            xs.append(0.0)
+            ys.append(0.0)
         x_bounds = plot.axes.get('x')
         y_bounds = plot.axes.get('y')
         if x_bounds is None:
@@ -1108,7 +1682,7 @@ class Graph:
                 except _BudgetExceeded:
                     exhausted = True
                     points = []
-                sampled.append((curve, points, True))
+                sampled.append((curve, points, 'implicit'))
         xspan, yspan = xhi - xlo, yhi - ylo
         hover_readout = ''
         if hover is not None and drawing_height and not empty:
@@ -1141,12 +1715,17 @@ class Graph:
                 prefix = f'{plot.sweep}={self.values[plot.sweep]:.4g}'
                 readout = prefix + ((' | ' + readout) if readout else '')
             if not readout:
-                readout = 'x/y graph'
+                if plot.curves and all(c.kind == 'vector' for c in plot.curves):
+                    count = sum(len(points) for _, points, kind in sampled if kind == 'vector')
+                    readout = f'{count} vector' + ('' if count == 1 else 's')
+                else:
+                    readout = 'x/y graph'
         if exhausted:
             readout = 'budget limit | ' + readout
         elif empty:
             readout = 'empty axis | ' + readout
-        elif drawing_height and not xs and not any(c.kind == 'implicit' for c in plot.curves):
+        elif (drawing_height and not xs
+              and not any(c.kind in ('implicit', 'vector') for c in plot.curves)):
             readout = 'no finite samples | ' + readout
         readout += hover_readout
         readout = (WARNING if exhausted or empty else ACCENT) + readout[:width] + BASE
@@ -1156,6 +1735,21 @@ class Graph:
                       empty=empty, exhausted=exhausted, xspan=xspan, yspan=yspan,
                       title=title, x_label=x_label, readout=readout,
                       hover=hover, hover_readout=hover_readout)
+
+    @staticmethod
+    def _arrow(canvas, x0, y0, x1, y1, color, nx, ny):
+        canvas.line(x0, y0, x1, y1, color)
+        canvas.dot(x1, y1, color)
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length < 1:
+            return
+        head = min(length * 0.6, max(2.0, min(20.0, min(nx, ny) * 0.05)))
+        angle = math.atan2(dy, dx)
+        for offset in (2.6, -2.6):
+            canvas.line(x1, y1,
+                        round(x1 - head * math.cos(angle + offset)),
+                        round(y1 - head * math.sin(angle + offset)), color)
 
     def _draw(self, scene, canvas):
         if not scene.drawing_height or scene.empty:
@@ -1186,8 +1780,21 @@ class Graph:
                 ystep = max(1, ny // max(1, scene.drawing_height * 2)) * 2
                 for y in range(0, ny, ystep):
                     canvas.dot(x, y, MUTED)
-        for index, (curve, points, discrete) in enumerate(scene.sampled):
-            color = _PALETTE[index % len(_PALETTE)]
+        for index, (curve, points, kind) in enumerate(scene.sampled):
+            color = curve.color or _PALETTE[index % len(_PALETTE)]
+            if kind == 'vector':
+                for tail, tip in points:
+                    x0, y0 = tail
+                    x1, y1 = tip
+                    if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+                        continue
+                    if not (xlo <= x0 <= xhi and ylo <= y0 <= yhi
+                            and xlo <= x1 <= xhi and ylo <= y1 <= yhi):
+                        continue
+                    self._arrow(canvas, pixel_x(x0), pixel_y(y0),
+                                pixel_x(x1), pixel_y(y1), color, nx, ny)
+                continue
+            discrete = kind == 'implicit'
             previous = None
             for point in points:
                 if point is None:
