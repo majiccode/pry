@@ -3052,7 +3052,8 @@ def hover_region(position):
     if position is None or about_open:
         return None
     x, y = position
-    zones = ([(row, left, right, (action, argument)) for row, left, right, action, argument in git_panel.zones]
+    zones = ([(row, left, right, (action, argument)) for row, left, right, action, argument in git_panel.zones
+              if action != 'graph']
              if git_panel is not None else [])
     zones += [(row, left, right, action) for (row, left, right), action in click_zones.items()
               if git_panel is None or row == 1 or action[0] == 'panel_choice']

@@ -319,26 +319,11 @@ class ScratchpadPanel:
                                     file_name=file_name, mime=mime,
                                     is_image=is_image, is_directory=is_directory)
                 actions = []
-                previewable = False
-                try:
-                    file_size = int(meta.get('file_size', '0') or 0)
-                except (TypeError, ValueError):
-                    file_size = 0
-                if (not is_directory and Path(entry_path).is_file()
-                        and not is_image and file_size <= 128 * 1024):
-                    try:
-                        Path(entry_path).read_text(encoding='utf-8')
-                        previewable = True
-                    except (OSError, UnicodeDecodeError, ValueError):
-                        previewable = False
-                if not is_directory and Path(entry_path).is_file() and not previewable:
+                if not is_directory and (Path(entry_path).is_file() or owner_id):
                     actions.append(dict(label='Download file',
                                         target=dict(kind='file_download', path=entry_path,
-                                                    user_id=owner_id, user_name=owner_name)))
-                elif not is_directory and not is_image and not Path(entry_path).is_file() and owner_id:
-                    actions.append(dict(label='Download file',
-                                        target=dict(kind='file_download', path=entry_path,
-                                                    user_id=owner_id, user_name=owner_name)))
+                                                    user_id=owner_id, user_name=owner_name,
+                                                    file_name=file_name)))
                 page = dict(title=f'{file_name} · file source',
                             entries=[dict(label='Open file', target=entry_target)],
                             actions=actions)
@@ -779,7 +764,7 @@ class ScratchpadPanel:
             return
         self.message = f'Downloaded {source.name} to {destination}'
 
-    def _retrieve_file(self, user_id, path, entry_index=None):
+    def _retrieve_file(self, user_id, path, entry_index=None, download=False):
         """Request a file from a peer and save it locally."""
         if not self.network:
             self.message = 'Network not available'
@@ -789,7 +774,7 @@ class ScratchpadPanel:
             self.message = f'No connection to peer for user {user_id}'
             return
         self.message = f'Retrieving {Path(path).name}…'
-        self._pending_file_retrieve = (path, entry_index)
+        self._pending_file_retrieve = (path, entry_index, download)
         self.network.request_file(peer_id, path, self._on_file_retrieved)
 
     def _localize_file_targets(self, remote_path, local_path):
@@ -800,7 +785,8 @@ class ScratchpadPanel:
             for item in list(page.get('entries', [])) + list(page.get('actions', [])):
                 target = item.get('target')
                 if (isinstance(target, dict) and target.get('path') == remote
-                        and target.get('kind') in ('file_source', 'file_retrieve', 'path')):
+                        and target.get('kind') in ('file_source', 'file_retrieve',
+                                                   'file_download', 'path')):
                     target['path'] = local
                     if target.get('kind') != 'path':
                         target['file_name'] = Path(local).name
@@ -815,12 +801,13 @@ class ScratchpadPanel:
             self.message = f'File retrieval failed: {error}'
             self._pending_file_retrieve = None
             return
-        path, entry_index = self._pending_file_retrieve or (None, None)
+        path, entry_index, download = self._pending_file_retrieve or (None, None, False)
         if path:
             try:
                 dest = self.shared_files_dir / Path(path).name
                 dest.write_bytes(data)
-                self.message = f'File retrieved: {dest.name}'
+                if not download:
+                    self.message = f'File retrieved: {dest.name}'
             except OSError as exc:
                 self.message = f'Could not save file: {exc}'
                 self._pending_file_retrieve = None
@@ -831,6 +818,8 @@ class ScratchpadPanel:
         def refreshed(_result):
             if path and dest:
                 self._localize_file_targets(path, dest)
+                if download:
+                    self._download_file(dest)
             focus = self.inspector.focus
             if focus is not None:
                 self.inspector.open(focus)
@@ -1203,7 +1192,7 @@ class ScratchpadPanel:
             hx, hy = self.graph_hover
             if margin + 1 <= hx <= cols and top + 2 <= hy <= top + 1 + graph_height:
                 px = (hx - (margin + 1)) * 2
-                py = (hy - (top + 2)) * 4
+                py = (hy - (top + 2)) * 2
                 hover = (px, py)
         for number, line in enumerate(graph.render(cols, graph_height, index, hover=hover)):
             put(top + 2 + number, line)
@@ -1398,7 +1387,7 @@ class ScratchpadPanel:
             if path and Path(path).is_file():
                 self._download_file(path)
             elif user_id and self.network:
-                self._retrieve_file(user_id, path)
+                self._retrieve_file(user_id, path, download=True)
             else:
                 self.message = 'File is not available locally and no peer is connected.'
             return None

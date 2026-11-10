@@ -360,7 +360,7 @@ Ctrl+S retries saving after a transient filesystem error.
 ### Interactive note graphs
 
 In `/notes`, type `/graph` on its own line and press Enter. Pry inserts a complete
-example into `notes.md` and opens an interactive Braille graph:
+example into `notes.md` and opens an interactive Unicode block graph:
 
 ```graph
 x_axis=[-2..2]
@@ -415,8 +415,9 @@ Arithmetic supports `+ - * / % **` and `^` for powers, parentheses, `pi`, `e`,
 `min`, and `max`. Statements can be on separate lines or separated by semicolons;
 `#` starts a comment. Invalid expressions show a line-specific error. Domain
 errors produce gaps. Evaluation is bounded and does not execute Python code.
-Braille provides 2-by-4 drawing dots per terminal cell; use a Unicode-capable
-fixed-width font. No graphics protocol or third-party dependency is needed.
+Quadrant and half-block characters provide 2-by-2 drawing cells per terminal
+character; use a Unicode-capable fixed-width font. No graphics protocol or
+third-party dependency is needed.
 
 Use **Ctrl+B** or `/sidebar` to toggle the saved
 session sidebar. The preference persists across launches, and toggling preserves

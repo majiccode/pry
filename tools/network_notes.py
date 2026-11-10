@@ -285,9 +285,7 @@ class NetworkNotes:
                              daemon=True, name='nn-tcp-recv').start()
             with self._lock:
                 self.connections[peer_id] = conn
-            if self._pending_text:
-                # Only push non-empty content; an empty node should not erase peers.
-                self.send_sync(force=True)
+            self.send_sync(force=True)
             self.events.put(('connect_result',
                              {'id': peer_id, 'host': host, 'port': port, 'success': True}))
         threading.Thread(target=worker, daemon=True, name='nn-tcp-connect').start()

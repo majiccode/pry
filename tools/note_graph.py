@@ -28,9 +28,9 @@ handles appear as sliders alongside the parameter sliders.
 
 render(width, height) returns at most height rows of at most width visible
 columns, capped at 240 columns and 64 rows. Height includes the title/legend,
-axis labels, and readout, not slider controls. Braille uses real Unicode
-characters for a 2-by-4 subcell drawing grid. ANSI SGR sequences do not count
-toward the width. Small viewports gracefully omit drawing rows.
+axis labels, and readout, not slider controls. Quadrant and half-block
+characters provide a 2-by-2 subcell drawing grid. ANSI SGR sequences do not
+count toward the width. Small viewports gracefully omit drawing rows.
 """
 
 import ast
@@ -84,7 +84,8 @@ _PALETTE = (SECONDARY, SUCCESS, WARNING, '\033[38;5;213m',
             '\033[38;5;141m')
 _PAN_SENSITIVITY = 0.3
 _NAME = r'[A-Za-z_][A-Za-z_0-9]{0,31}'
-_DOTS = ((1, 8), (2, 16), (4, 32), (64, 128))
+_BLOCKS = (' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛',
+           '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█')
 _AXIS_DECLARATIONS = {'axisx': 'x', 'axisy': 'y', 'x_axis': 'x', 'y_axis': 'y',
                       'xrange': 'x', 'yrange': 'y'}
 _AXIS_CONTROL_SUFFIX = {'.min': 0, '.max': 1}
@@ -930,7 +931,7 @@ class Graph:
         drawing_height = max(0, height - 3)
         margin = 10 if width >= 24 else 0
         cols = width - margin
-        nx, ny = max(2, cols * 2), max(4, drawing_height * 4)
+        nx, ny = max(2, cols * 2), max(2, drawing_height * 2)
         sampled = []
         xs, ys = [], []
         if drawing_height:
@@ -989,9 +990,9 @@ class Graph:
         colors = [[BORDER] * cols for _ in range(drawing_height)]
 
         def dot(x, y, color):
-            if 0 <= x < nx and 0 <= y < drawing_height * 4:
-                row, col = y // 4, x // 2
-                bits[row][col] |= _DOTS[y % 4][x % 2]
+            if 0 <= x < nx and 0 <= y < drawing_height * 2:
+                row, col = y // 2, x // 2
+                bits[row][col] |= 1 << ((y % 2) * 2 + (x % 2))
                 colors[row][col] = color
 
         def pixel_x(value):
@@ -1017,7 +1018,7 @@ class Graph:
                         dot(x, y, MUTED)
                 elif xlo <= playhead <= xhi:
                     x = pixel_x(playhead)
-                    for y in range(0, ny, 4):
+                    for y in range(0, ny, 2):
                         dot(x, y, MUTED)
             for index, (curve, points, discrete) in enumerate(sampled):
                 color = _PALETTE[index % len(_PALETTE)]
@@ -1036,7 +1037,7 @@ class Graph:
                     px, py = pixel_x(x), pixel_y(y)
                     dot(px, py, color)
                     if not discrete and previous is not None:
-                        if abs(py - previous) <= max(2, ny // 4):
+                        if abs(py - previous) <= max(2, ny // 2):
                             distance = abs(py - previous)
                             for step in range(1, distance):
                                 dot(px, previous + (1 if py > previous else -1) * step, color)
@@ -1044,8 +1045,8 @@ class Graph:
         hover_readout = ''
         if hover is not None and drawing_height and not empty:
             hx, hy = hover
-            if 0 <= hx < nx and 0 <= hy < drawing_height * 4:
-                for py in range(drawing_height * 4):
+            if 0 <= hx < nx and 0 <= hy < drawing_height * 2:
+                for py in range(drawing_height * 2):
                     dot(hx, py, ACCENT)
                 for px in range(nx):
                     dot(px, hy, ACCENT)
@@ -1064,7 +1065,7 @@ class Graph:
                 if color != last_color:
                     rendered += color
                     last_color = color
-                rendered += chr(0x2800 + bits[row][col]) if bits[row][col] else ' '
+                rendered += _BLOCKS[bits[row][col]]
             rows.append(rendered + BASE)
         if height >= 3:
             left = f'{xlo:.4g}' if not empty else 'axes outside range'
